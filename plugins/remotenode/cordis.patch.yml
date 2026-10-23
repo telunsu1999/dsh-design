@@ -1,0 +1,9 @@
+# remotenode bundle patch: one Host row named after the package.
+# The Client half rides on the same package (dsh.client in package.json).
+# Runtime configuration lives in $DSH_HOME/remotenode/config.json (see README.md);
+# the row config only needs overrides, for example:
+#   config: { configFile: /root/.dsh/remotenode/config.json }
+- insert:
+    - id: remotenode
+      name: '@dsh-design/remotenode'
+      config: {}

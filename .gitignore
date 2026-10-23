@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+dist/
+lib/*.map
+
+# 本地运行数据/日志（不应进仓库）
+*.log
+*.log.*
+remotenode/data/
+remotenode/workspace/
+plugins/remotenode/data/
+plugins/remotenode/workspace/
+**/remotenode/data/
+**/remotenode/workspace/
+
+# 密钥与凭据（正常情况下位于 $DSH_HOME，此处兜底）
+peer-secret.txt
+*.token.json
+.credentials.yaml
+.env
+.env.*
+
+# 系统噪声
+.DS_Store
+Thumbs.db
+*.pyc
+__pycache__/

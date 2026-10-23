@@ -1,0 +1,31 @@
+# ────────────────────────────────────────────────────────────────
+# 台式机 worker 的 ACP profile 补丁（可选）
+#
+# 位置：C:\dsh-worker\.dsh\profiles\acp\cordis.patch.yml
+# 首次运行 `dsh --profile acp` 会自动创建该 profile 目录（只写文件、不联网）。
+#
+# 默认 ACP profile 已经带：模型 deepseek-official / deepseek-v4-flash、
+# Windows 下的 pwsh 工具（bash 自动禁用）、文件/搜索/jobs/skill 等工具。
+# 一般不需要改动即可使用；下面是常用的两类覆盖。
+# ────────────────────────────────────────────────────────────────
+
+# 1) 把 worker 默认模型对齐大脑（可选；若默认模型可用就删掉这一段）
+- id: acp
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+
+# 2) 可选：给 worker 挂本机 MCP server（示例：stdio 方式启动的 ComfyUI MCP）
+#    - 先从 npm 安装对应 server（例如 Comfy-Org/comfy-mcp），确认能独立启动；
+#    - server 必须只把 ACP JSON 写到 stdout，日志写 stderr，否则会污染协议。
+# - insert:
+#     - id: mcp-comfy
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: comfy
+#         transport: stdio
+#         command: node
+#         args: ['C:/dsh-worker/mcp/comfy-mcp/dist/index.js']
+#         env:
+#           COMFYUI_URL: http://127.0.0.1:8188
+#         toolCallTimeoutMs: 900000

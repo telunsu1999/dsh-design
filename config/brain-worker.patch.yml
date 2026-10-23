@@ -1,0 +1,47 @@
+# ────────────────────────────────────────────────────────────────
+# 大脑节点（本机 dsh web）远程 worker 补丁片段
+#
+# 放置位置（二选一）：
+#   1. 持久化：合并进 $DSH_HOME/profiles/<profile>/cordis.patch.yml
+#      （本项目部署即 /root/.dsh/profiles/web/cordis.patch.yml）
+#   2. 临时试用：dsh web --patch /path/to/brain-worker.patch.yml
+#
+# 依赖：先安装插件包
+#   dsh plugin --profile web add @deepseek-ai/dsh-subagent-acp@0.2.1-rc.2
+#
+# 修改点（按你的环境替换）：
+#   - command: node 的绝对路径（用 `command -v node` 查）
+#   - args[0]: acp-ssh-bridge.mjs 的绝对路径
+#   - args[2]: ~/.ssh/config 里的 SSH 别名（下文示例 dsh-desktop）
+#   - args[3]: 台式机上启动 ACP worker 的脚本路径（正斜杠）
+#   - args[4]: 台式机上的 worker 工作目录（正斜杠，必须存在）
+# ────────────────────────────────────────────────────────────────
+- insert:
+    # ACP 子代理 backend：每次委托在台式机上启动一个独立 DSH 进程，
+    # 通过 SSH stdio 走 ACP 协议；桥负责把 session cwd 改写成远端工作目录。
+    - id: subagent-acp-worker
+      name: '@deepseek-ai/dsh-subagent-acp'
+      config:
+        providerName: worker-acp
+        command: /root/.nvm/versions/node/v22.22.1/bin/node
+        args:
+          - /root/AiWork/DSH_Design/scripts/acp-ssh-bridge.mjs
+          - --ssh
+          - dsh-desktop
+          - C:/dsh-worker/run-acp.cmd
+          - C:/dsh-worker/workspace
+        # worker 的工具审批请求由大脑自动放行（allow_once）。
+        # 若希望一律拒绝，改成 reject；想逐步放开可改回 ask 语义需要自定义。
+        permission: allow
+        disposeEofGraceMs: 12000
+        disposeGraceMs: 5000
+
+    # 暴露给模型的委托工具：subagent_worker
+    - id: tool-subagent-worker
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: worker-acp
+        toolName: subagent_worker
+        # ACP provider 不支持 depthLimit / 模型路由 / agentOptions，
+        # 必须用 provider-managed 让远端自己管递归预算。
+        maxDepth: provider-managed

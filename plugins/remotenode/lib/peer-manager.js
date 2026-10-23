@@ -1,0 +1,987 @@
+/**
+ * peer-manager.js — remotenode 对等连接管理器（SPEC §5.9）。
+ *
+ * 职责：
+ *  1. 按 config.listen 起 TCP 监听（enabled 时），接受对端拨入；
+ *  2. 为 `dial:'auto'` 的 peer 维护拨号循环，失败/断链后指数退避重连
+ *     （1s → 2s → 5s → 10s → 30s 上限）；
+ *  3. 连接去重：同一 peer 只保留 `dialerNodeId === canonicalDialer(self, peer)`
+ *     的那条链路，另一条 close('peer/duplicate')；去重关闭后 3s 内不重拨，
+ *     避免两条链路互相踩踏造成拨号抖动；
+ *  4. 给 UI 提供 `state()`（不含 secret）、给上层提供 request/notify/broadcast/
+ *     dialNow/dialAllOffline/linkFor；
+ *  5. 定期 `peer.ping` 测 rttMs（只记录，不因 ping 失败断链；链路存活由
+ *     peer-link 心跳判定）。
+ *
+ * 纯 ESM、零第三方依赖，只用 node: 内置模块。所有监听回调都防御式：
+ * remotenode 的故障不能拖垮 DSH 宿主进程。
+ */
+
+import { randomUUID } from 'node:crypto'
+import { Socket, createServer } from 'node:net'
+
+import { canonicalDialer } from './dedupe.js'
+import { ProtocolError, asProtocolError } from './errors.js'
+import { NonceCache } from './handshake.js'
+import { isNodeId } from './ids.js'
+import { createPeerLink } from './peer-link.js'
+
+/** 重连退避序列（SPEC §5.9：1s → 2s → 5s → 10s → 30s 上限）。 */
+const BACKOFF_MS = Object.freeze([1000, 2000, 5000, 10000, 30000])
+/** 去重关闭后的静默期：期间不因 duplicate 重拨（SPEC §5.9 要求至少 3s）。 */
+const DUPLICATE_QUIET_MS = 3000
+/** rtt 主动 ping 默认间隔（SPEC 心跳 10s；ping 15s 已与 Lead 确认）。 */
+const DEFAULT_RTT_INTERVAL_MS = 15000
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 10000
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30000
+const SERVER_CLOSE_GRACE_MS = 1000
+
+/** @param {unknown} value */
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** @param {unknown} value @param {number} fallback */
+function positiveNumber(value, fallback) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? number : fallback
+}
+
+/** 保证字符串单行、非空。 @param {unknown} value @param {string} fallback */
+function text(value, fallback = '') {
+  if (typeof value !== 'string' && typeof value !== 'number') return fallback
+  const single = String(value).replace(/\s+/g, ' ').trim()
+  return single === '' ? fallback : single
+}
+
+/** 空 logger 兜底。 */
+function createLogger(logger) {
+  const base = isRecord(logger) ? logger : {}
+  const call = level => (...args) => {
+    try {
+      const fn = typeof base[level] === 'function' ? base[level] : base.log
+      if (typeof fn === 'function') fn.apply(base, args)
+    } catch {
+      /* 宿主 logger 抛错也不能影响管理器 */
+    }
+  }
+  return { debug: call('debug'), info: call('info'), warn: call('warn'), error: call('error') }
+}
+
+/** 本机平台名（协议枚举 'windows'|'linux'|'macos'|'unknown'）。 */
+function platformName() {
+  switch (process.platform) {
+    case 'win32':
+      return 'windows'
+    case 'darwin':
+      return 'macos'
+    case 'linux':
+      return 'linux'
+    default:
+      return 'unknown'
+  }
+}
+
+/** 关闭原因是否属于认证/协议类失败（UI 标 error 而不是 offline）。 */
+function isAuthFailureReason(reason) {
+  return typeof reason === 'string'
+    && (reason.startsWith('auth/')
+      || reason === 'protocol/unsupported'
+      || reason === 'handshake-timeout'
+      || reason.startsWith('secret/')
+      || reason === 'peer/internal')
+}
+
+/**
+ * PeerManager：监听、拨号、重连、去重与链路路由。
+ */
+class PeerManager {
+  #config
+  #self
+  #logger
+  #handlers
+  #requestTimeoutMs
+  #heartbeatIntervalMs
+  #heartbeatTimeoutMs
+  #rttIntervalMs
+  #nonceCache
+  #capabilities
+  #limits
+
+  #listen
+  #server = null
+  #started = false
+  #stopping = false
+  #listenError = null
+
+  /** @type {Set<any>} 当前持有的 link（listener 的 linkId 握手后才会落定为 canonical 值） */
+  #links = new Set()
+  /** @type {Map<string, any>} peerNodeId -> 当前 canonical ready link */
+  #readyLinks = new Map()
+  /** @type {Map<string, any>} peerNodeId -> 配置 */
+  #peerConfigs = new Map()
+  /** @type {string[]} 配置顺序 */
+  #peerOrder = []
+  /** @type {Map<string, any>} peerNodeId -> UI 状态 entry */
+  #entries = new Map()
+  /** @type {Map<string, number>} peerNodeId -> 退避档位 */
+  #dialAttempts = new Map()
+  /** @type {Map<string, NodeJS.Timeout>} peerNodeId -> 重连 timer */
+  #dialTimers = new Map()
+  /** @type {Map<string, Promise<any>>} peerNodeId -> 进行中的拨号 */
+  #dialing = new Map()
+  /** @type {Map<any, NodeJS.Timeout>} link 对象 -> rtt ping interval（linkId 是 pair key，不唯一） */
+  #pingTimers = new Map()
+  /** @type {Set<any>} 已经向上层转发过 onLinkUp 的 link 对象（保证 up/down 成对） */
+  #announcedLinks = new Set()
+
+  /**
+   * @param {object} options
+   * @param {Record<string, any>} options.config 合并后的运行时配置（SPEC §4）
+   * @param {string} [options.instanceEpoch]
+   * @param {object} [options.logger]
+   * @param {object} [options.handlers]
+   * @param {(link:any)=>void} [options.handlers.onLinkUp]
+   * @param {(link:any, reason:string)=>void} [options.handlers.onLinkDown]
+   * @param {(link:any, method:string, params:unknown, ctx:object)=>unknown} [options.handlers.onRequest]
+   * @param {(link:any, method:string, params:unknown)=>void} [options.handlers.onNotification]
+   * @param {(link:any, header:object, payload:Buffer)=>void} [options.handlers.onBinary]
+   */
+  constructor(options) {
+    if (!isRecord(options)) throw new TypeError('createPeerManager requires an options object')
+    const config = isRecord(options.config) ? options.config : {}
+    this.#config = config
+    const nodeId = config.nodeId
+    if (!isNodeId(nodeId)) throw new TypeError('config.nodeId must be a valid remotenode node id')
+    this.#self = {
+      nodeId,
+      nodeName: text(config.nodeName, nodeId),
+      instanceEpoch: text(options.instanceEpoch, '') || randomUUID(),
+      platform: platformName(),
+      protocol: 1,
+    }
+    this.#logger = createLogger(options.logger)
+    this.#handlers = isRecord(options.handlers) ? options.handlers : {}
+    this.#requestTimeoutMs = positiveNumber(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS)
+    this.#heartbeatIntervalMs = positiveNumber(config.heartbeatIntervalMs, DEFAULT_HEARTBEAT_INTERVAL_MS)
+    this.#heartbeatTimeoutMs = positiveNumber(config.heartbeatTimeoutMs, DEFAULT_HEARTBEAT_TIMEOUT_MS)
+    this.#rttIntervalMs = positiveNumber(config.rttIntervalMs, DEFAULT_RTT_INTERVAL_MS)
+    this.#nonceCache = options.nonceCache instanceof NonceCache ? options.nonceCache : new NonceCache()
+    this.#capabilities = isRecord(config.capabilities) ? config.capabilities : undefined
+    this.#limits = isRecord(config.limits) ? config.limits : undefined
+
+    const listen = isRecord(config.listen) ? config.listen : {}
+    this.#listen = {
+      enabled: listen.enabled === true,
+      host: text(listen.host, '127.0.0.1'),
+      port: Number.isInteger(Number(listen.port)) && Number(listen.port) >= 0 && Number(listen.port) <= 65535
+        ? Number(listen.port)
+        : 47201,
+    }
+
+    this.#loadPeers(Array.isArray(config.peers) ? config.peers : [])
+  }
+
+  // =====================================================================
+  // 公共只读视图
+  // =====================================================================
+
+  /** @returns {{nodeId:string,nodeName:string,instanceEpoch:string,platform:string,protocol:number}} */
+  get self() {
+    return { ...this.#self }
+  }
+
+  /** 配置里的 peer 列表（去掉 secret）。 */
+  get peers() {
+    return this.#peerOrder.map(peerNodeId => {
+      const peer = this.#peerConfigs.get(peerNodeId)
+      return {
+        nodeId: peer.nodeId,
+        nodeName: peer.nodeName,
+        host: peer.host,
+        port: peer.port,
+        dial: peer.dial,
+        configured: true,
+      }
+    })
+  }
+
+  /** 当前持有的所有未关闭 link（含 handshaking 与 ready）。 */
+  get links() {
+    return [...this.#links].filter(link => link.state !== 'closed')
+  }
+
+  /** 实际监听端口（listen.port=0 时为系统分配端口；未监听为 null）。 */
+  get listenPort() {
+    const address = this.#server?.address?.()
+    return address !== null && typeof address === 'object' ? address.port : null
+  }
+
+  /** 是否已 start()。 */
+  get started() {
+    return this.#started
+  }
+
+  /** 监听失败的错误信息（start() 会抛错；此处给 UI/诊断）。 */
+  get listenError() {
+    return this.#listenError
+  }
+
+  /** @returns {any} peerNodeId 对应的 ready link，未连通为 undefined */
+  linkFor(nodeId) {
+    return this.#readyLinks.get(nodeId)
+  }
+
+  /** @returns {number} ready link 数量（去重后每个 peer 至多 1 条） */
+  activeLinkCount() {
+    return this.#readyLinks.size
+  }
+
+  /**
+   * UI 状态快照（不含 secret）。每项：
+   * { peerNodeId, nodeName, configured, dial, state:'online'|'offline'|'dialing'|'error',
+   *   direction:'in'|'out'|null, linkId?, lastSeen?, rttMs?, remote?, error? }
+   * @returns {Array<Record<string, any>>}
+   */
+  state() {
+    return this.#peerOrder.map(peerNodeId => {
+      const entry = this.#entries.get(peerNodeId) ?? {}
+      const link = this.#readyLinks.get(peerNodeId)
+      const active = link !== undefined && link.state === 'ready' ? link : null
+      return {
+        peerNodeId,
+        nodeName: entry.nodeName ?? peerNodeId,
+        configured: true,
+        dial: entry.dial ?? 'auto',
+        state: active !== null ? 'online' : (entry.state ?? 'offline'),
+        direction: active !== null ? (active.direction === 'outbound' ? 'out' : 'in') : null,
+        linkId: active !== null ? active.linkId : undefined,
+        lastSeen: active !== null ? active.lastSeen : (entry.lastSeen ?? null),
+        rttMs: active !== null ? (entry.rttMs ?? active.rttMs ?? null) : (entry.rttMs ?? null),
+        remote: active !== null
+          ? normalizeRemote(active.remote, peerNodeId, entry.nodeName)
+          : (entry.remote ?? null),
+        error: active !== null ? null : (entry.error ?? null),
+      }
+    })
+  }
+
+  // =====================================================================
+  // 生命周期
+  // =====================================================================
+
+  /** 起监听 + 为 dial:'auto' 的 peer 拨号。幂等；监听失败时抛错。 */
+  async start() {
+    if (this.#started) return
+    if (this.#stopping) throw new Error('peer manager is stopping')
+    this.#started = true
+    this.#listenError = null
+    if (this.#listen.enabled) {
+      try {
+        await this.#startServer()
+      } catch (error) {
+        this.#started = false
+        this.#listenError = error instanceof Error ? error.message : String(error)
+        this.#logger.warn(`[peer-manager] listen ${this.#listen.host}:${this.#listen.port} failed: ${this.#listenError}`)
+        throw error
+      }
+      this.#logger.info(`[peer-manager] ${this.#self.nodeId} listening on ${this.#listen.host}:${this.listenPort}`)
+    } else {
+      this.#logger.info(`[peer-manager] ${this.#self.nodeId} listen disabled; outbound only`)
+    }
+    for (const peerNodeId of this.#peerOrder) {
+      const peer = this.#peerConfigs.get(peerNodeId)
+      if (peer.dial !== 'auto') continue
+      this.#dial(peer).catch(error => this.#logger.warn(`[peer-manager] dial ${peerNodeId} failed`, error))
+    }
+  }
+
+  /** 停止：清 timer、关链路、关监听。幂等，不抛错。 */
+  async stop() {
+    if (this.#stopping) return
+    this.#stopping = true
+    this.#started = false
+    for (const timer of this.#dialTimers.values()) clearTimeout(timer)
+    this.#dialTimers.clear()
+    for (const timer of this.#pingTimers.values()) clearInterval(timer)
+    this.#pingTimers.clear()
+    const links = [...this.#links]
+    this.#links.clear()
+    this.#readyLinks.clear()
+    this.#announcedLinks.clear()
+    for (const link of links) {
+      try {
+        link.close('stopped')
+      } catch (error) {
+        this.#logger.warn('[peer-manager] link close failed during stop', error)
+      }
+    }
+    for (const entry of this.#entries.values()) {
+      entry.state = 'offline'
+      entry.direction = null
+      entry.linkId = undefined
+      entry.rttMs = null
+    }
+    const server = this.#server
+    this.#server = null
+    if (server !== null) {
+      await new Promise(resolve => {
+        let finished = false
+        /** @type {NodeJS.Timeout|null} */
+        let grace = null
+        const finish = () => {
+          if (finished) return
+          finished = true
+          if (grace !== null) clearTimeout(grace)
+          resolve()
+        }
+        grace = setTimeout(finish, SERVER_CLOSE_GRACE_MS)
+        grace.unref?.()
+        try {
+          server.close(finish)
+        } catch {
+          finish()
+        }
+      })
+    }
+    this.#stopping = false
+    this.#logger.info(`[peer-manager] ${this.#self.nodeId} stopped`)
+  }
+
+  // =====================================================================
+  // 出站路由
+  // =====================================================================
+
+  /**
+   * 向 peer 发请求（peer 离线时 reject ProtocolError('peer/offline')）。
+   * @param {string} nodeId
+   * @param {string} method
+   * @param {unknown} [params]
+   * @param {{timeoutMs?:number}} [options]
+   * @returns {Promise<any>}
+   */
+  request(nodeId, method, params, options) {
+    const link = this.#readyLinks.get(nodeId)
+    if (link === undefined) {
+      return Promise.reject(new ProtocolError('peer/offline', `peer ${nodeId} is offline`, { peerNodeId: nodeId }))
+    }
+    return link.request(method, params, options)
+  }
+
+  /**
+   * 向 peer 发通知。
+   * @param {string} nodeId
+   * @param {string} method
+   * @param {unknown} [params]
+   * @returns {boolean}
+   */
+  notify(nodeId, method, params) {
+    const link = this.#readyLinks.get(nodeId)
+    return link === undefined ? false : link.notify(method, params)
+  }
+
+  /**
+   * 向所有 ready link 广播通知。
+   * @param {string} method
+   * @param {unknown} [params]
+   * @returns {number} 成功发出的链路数
+   */
+  broadcast(method, params) {
+    let sent = 0
+    for (const link of this.#readyLinks.values()) {
+      try {
+        if (link.notify(method, params)) sent += 1
+      } catch (error) {
+        this.#logger.warn(`[peer-manager] broadcast to ${link.peerNodeId} failed`, error)
+      }
+    }
+    return sent
+  }
+
+  /**
+   * 立即拨一个 peer（会取消该 peer 已排队的重连；等待 TCP 建连后返回 link）。
+   * @param {string} nodeId
+   * @returns {Promise<any|null>}
+   */
+  async dialNow(nodeId) {
+    const peer = this.#peerConfigs.get(nodeId)
+    if (peer === undefined) return null
+    this.#clearDialTimer(nodeId)
+    return this.#dial(peer)
+  }
+
+  /** 对每个没有 ready link 的 dial:'auto' peer 立即拨号（HTTP refresh 用）。 */
+  async dialAllOffline() {
+    const pending = []
+    for (const peer of this.#peerConfigs.values()) {
+      if (peer.dial !== 'auto') continue
+      if (this.#readyLinks.has(peer.nodeId)) continue
+      this.#clearDialTimer(peer.nodeId)
+      pending.push(this.#dial(peer))
+    }
+    await Promise.allSettled(pending)
+  }
+
+  // =====================================================================
+  // 配置装载
+  // =====================================================================
+
+  /** @param {unknown[]} rawPeers */
+  #loadPeers(rawPeers) {
+    for (const raw of rawPeers) {
+      if (!isRecord(raw)) {
+        this.#logger.warn('[peer-manager] peer entry is not an object; skipped')
+        continue
+      }
+      const nodeId = text(raw.nodeId, '')
+      if (!isNodeId(nodeId)) {
+        this.#logger.warn(`[peer-manager] invalid peer nodeId ${JSON.stringify(raw.nodeId)}; skipped`)
+        continue
+      }
+      if (nodeId === this.#self.nodeId) {
+        this.#logger.warn(`[peer-manager] peer ${nodeId} equals self; skipped`)
+        continue
+      }
+      const port = Number(raw.port)
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        this.#logger.warn(`[peer-manager] peer ${nodeId} has invalid port; skipped`)
+        continue
+      }
+      const secret = typeof raw.secret === 'string' ? raw.secret : ''
+      const peer = {
+        nodeId,
+        nodeName: text(raw.nodeName, nodeId),
+        host: text(raw.host, '127.0.0.1'),
+        port,
+        secret,
+        dial: raw.dial === 'off' ? 'off' : 'auto',
+      }
+      if (secret.length === 0) {
+        this.#logger.warn(`[peer-manager] peer ${nodeId} has empty secret; handshake will fail`)
+      }
+      this.#peerConfigs.set(nodeId, peer)
+      this.#peerOrder.push(nodeId)
+      this.#entries.set(nodeId, {
+        nodeName: peer.nodeName,
+        dial: peer.dial,
+        state: 'offline',
+        direction: null,
+        linkId: undefined,
+        lastSeen: null,
+        rttMs: null,
+        remote: null,
+        error: null,
+      })
+    }
+  }
+
+  // =====================================================================
+  // 监听
+  // =====================================================================
+
+  async #startServer() {
+    const server = createServer(socket => this.#onInbound(socket))
+    this.#server = server
+    await new Promise((resolve, reject) => {
+      const onError = error => {
+        cleanup()
+        this.#server = null
+        reject(error)
+      }
+      const onListening = () => {
+        cleanup()
+        resolve()
+      }
+      const cleanup = () => {
+        server.off('error', onError)
+        server.off('listening', onListening)
+      }
+      server.once('error', onError)
+      server.once('listening', onListening)
+      try {
+        server.listen(this.#listen.port, this.#listen.host)
+      } catch (error) {
+        cleanup()
+        this.#server = null
+        reject(error)
+      }
+    })
+    server.on('error', error => {
+      this.#logger.warn(`[peer-manager] listener error: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
+
+  /** 处理一个入站 TCP 连接：交给 listener 角色的 peer-link 完成握手。 */
+  #onInbound(socket) {
+    try {
+      if (!this.#started) {
+        socket.destroy()
+        return
+      }
+      socket.setNoDelay?.(true)
+      const link = createPeerLink({
+        socket,
+        role: 'listener',
+        nodeId: this.#self.nodeId,
+        // listener 握手前不知道对端；hello 校验通过后由 resolver 落定 canonical linkId。
+        linkId: peerNodeId => this.#canonicalLinkId(peerNodeId),
+        secretFor: peerNodeId => this.#secretFor(peerNodeId),
+        nodeName: this.#self.nodeName,
+        instanceEpoch: this.#self.instanceEpoch,
+        platform: this.#self.platform,
+        ...(this.#capabilities === undefined ? {} : { capabilities: this.#capabilities }),
+        ...(this.#limits === undefined ? {} : { limits: this.#limits }),
+        logger: this.#logger,
+        requestTimeoutMs: this.#requestTimeoutMs,
+        heartbeatIntervalMs: this.#heartbeatIntervalMs,
+        heartbeatTimeoutMs: this.#heartbeatTimeoutMs,
+        nonceCache: this.#nonceCache,
+        handlers: this.#linkHandlers(),
+      })
+      this.#links.add(link)
+      this.#logger.debug(`[peer-manager] inbound connection from ${socket.remoteAddress ?? '?'} as ${link.linkId}`)
+    } catch (error) {
+      this.#logger.warn('[peer-manager] inbound connection setup failed', error)
+      try {
+        socket.destroy()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** @param {string} peerNodeId */
+  #secretFor(peerNodeId) {
+    return this.#peerConfigs.get(peerNodeId)?.secret
+  }
+
+  /**
+   * 链路 key：SPEC §3 约定 linkId = `<较小 nodeId>~<较大 nodeId>`，两侧一致。
+   * @param {string} peerNodeId
+   * @returns {string}
+   */
+  #canonicalLinkId(peerNodeId) {
+    return [this.#self.nodeId, peerNodeId].sort().join('~')
+  }
+
+  /** 转发给每条 peer-link 的处理器；manager 的 handlers 原样转发（含 onBinary）。 */
+  #linkHandlers() {
+    const handlers = this.#handlers
+    /** @type {Record<string, Function>} */
+    const forwarded = {
+      onUp: link => this.#handleLinkUp(link),
+      onDown: (link, reason) => this.#handleLinkDown(link, reason),
+    }
+    if (typeof handlers.onRequest === 'function') {
+      forwarded.onRequest = (link, method, params, ctx) => handlers.onRequest(link, method, params, ctx)
+    }
+    if (typeof handlers.onNotification === 'function') {
+      forwarded.onNotification = (link, method, params) => {
+        this.#invokeHandler('onNotification', link, method, params)
+      }
+    }
+    if (typeof handlers.onBinary === 'function') {
+      forwarded.onBinary = (link, header, payload) => {
+        this.#invokeHandler('onBinary', link, header, payload)
+      }
+    }
+    return forwarded
+  }
+
+  /** 调用一个上层 handler；同步异常与 async rejection 都吞掉并记日志。 */
+  #invokeHandler(name, ...args) {
+    const handler = this.#handlers[name]
+    if (typeof handler !== 'function') return
+    try {
+      const result = handler(...args)
+      if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+        result.then(undefined, error => {
+          this.#logger.warn(`[peer-manager] ${name} handler rejected`, error)
+        })
+      }
+    } catch (error) {
+      this.#logger.warn(`[peer-manager] ${name} handler failed`, error)
+    }
+  }
+
+  // =====================================================================
+  // 链路 up / down：去重、状态、重连
+  // =====================================================================
+
+  /** @param {any} link */
+  #handleLinkUp(link) {
+    if (!this.#started) {
+      link.close('stopped')
+      return
+    }
+    const peerNodeId = link.peerNodeId
+    if (!isNodeId(peerNodeId)) {
+      link.close('auth/unknown-peer')
+      return
+    }
+    const peer = this.#peerConfigs.get(peerNodeId)
+    if (peer === undefined) {
+      this.#logger.warn(`[peer-manager] link from unconfigured peer ${peerNodeId}; closing`)
+      link.close('auth/unknown-peer')
+      return
+    }
+    const entry = this.#entries.get(peerNodeId)
+
+    // ---- 连接去重：只保留 dialerNodeId === canonicalDialer(self, peer) 的链路 ----
+    const existing = this.#readyLinks.get(peerNodeId)
+    /** @type {any} */
+    let duplicateToClose = null
+    if (existing !== undefined && existing !== link) {
+      const dialerNodeId = link.direction === 'outbound' ? this.#self.nodeId : peerNodeId
+      const canonical = canonicalDialer(this.#self.nodeId, peerNodeId)
+      const candidateIsCanonical = dialerNodeId === canonical
+      if (!candidateIsCanonical) {
+        this.#logger.info(
+          `[peer-manager] dedupe ${peerNodeId}: reject ${link.linkId} (${link.direction}) as peer/duplicate, keep ${existing.linkId}`,
+        )
+        try {
+          link.close('peer/duplicate')
+        } catch (error) {
+          this.#logger.warn('[peer-manager] rejecting duplicate link failed', error)
+        }
+        return
+      }
+      // canonical 候选胜出：先注册候选、再关旧链路，保证旧链路的 onLinkDown
+      // 到达上层时 linkFor(peer) 已经指向新链路（上层据此避免把会话标 offline）。
+      duplicateToClose = existing
+      this.#stopPing(existing)
+      this.#logger.info(
+        `[peer-manager] dedupe ${peerNodeId}: keep ${link.linkId} (${link.direction}), close ${existing.linkId} (${existing.direction}) as peer/duplicate`,
+      )
+    }
+
+    this.#readyLinks.set(peerNodeId, link)
+    this.#links.add(link)
+    this.#clearDialTimer(peerNodeId)
+    this.#dialAttempts.set(peerNodeId, 0)
+    if (entry !== undefined) {
+      entry.state = 'online'
+      entry.direction = link.direction === 'outbound' ? 'out' : 'in'
+      entry.linkId = link.linkId
+      entry.lastSeen = link.lastSeen
+      entry.rttMs = typeof link.rttMs === 'number' ? link.rttMs : null
+      entry.remote = normalizeRemote(link.remote, peerNodeId, peer.nodeName)
+      entry.error = null
+    }
+    this.#startPing(link)
+    this.#announcedLinks.add(link)
+    if (duplicateToClose !== null) {
+      try {
+        duplicateToClose.close('peer/duplicate')
+      } catch (error) {
+        this.#logger.warn('[peer-manager] closing duplicate link failed', error)
+      }
+    }
+    this.#logger.info(
+      `[peer-manager] link up: ${this.#self.nodeId} <-> ${peerNodeId} (${link.direction}, ${link.linkId})`,
+    )
+    this.#invokeHandler('onLinkUp', link)
+  }
+
+  /** @param {any} link @param {string} reason */
+  #handleLinkDown(link, reason) {
+    this.#links.delete(link)
+    this.#stopPing(link)
+    // 只有转发过 onLinkUp 的链路才转发 onLinkDown，保证上层看到的 up/down 成对；
+    // 去重时被拒的候选连接从未 onLinkUp，它的关闭只体现在 manager 日志与 state 里。
+    const wasAnnounced = this.#announcedLinks.delete(link)
+    const peerNodeId = link.peerNodeId
+    if (!isNodeId(peerNodeId)) return
+    const peer = this.#peerConfigs.get(peerNodeId)
+    const entry = this.#entries.get(peerNodeId)
+    const wasActive = this.#readyLinks.get(peerNodeId) === link
+    if (wasActive) {
+      this.#readyLinks.delete(peerNodeId)
+      if (entry !== undefined) {
+        entry.state = isAuthFailureReason(reason) ? 'error' : 'offline'
+        entry.direction = null
+        entry.linkId = undefined
+        entry.lastSeen = link.lastSeen
+        entry.rttMs = null
+        entry.remote = null
+        entry.error = typeof reason === 'string' && reason !== '' ? reason : 'link/closed'
+      }
+      this.#logger.info(`[peer-manager] link down: ${peerNodeId} (${reason})`)
+    } else if (entry !== undefined && link.direction === 'outbound' && !this.#readyLinks.has(peerNodeId)) {
+      // 拨号出去但握手失败：记 error 供 UI 展示（随后自动重连）。
+      entry.state = 'error'
+      entry.direction = null
+      entry.linkId = undefined
+      entry.error = typeof reason === 'string' && reason !== '' ? reason : 'handshake failed'
+    }
+    if (wasAnnounced) this.#invokeHandler('onLinkDown', link, reason)
+    if (peer !== undefined && peer.dial === 'auto' && this.#started && !this.#readyLinks.has(peerNodeId)) {
+      this.#scheduleReconnect(peer, reason)
+    }
+  }
+
+  /**
+   * 安排一次重连：正常断链按 1/2/5/10/30s 退避；因连接去重被关闭的链路
+   * 至少静默 3s 再拨（SPEC §5.9：3s 内不因重复关闭立即重拨，避免抖动）。
+   * @param {any} peer
+   * @param {string} reason
+   */
+  #scheduleReconnect(peer, reason) {
+    const duplicate = typeof reason === 'string' && reason.includes('duplicate')
+    let delay = this.#nextBackoff(peer.nodeId)
+    if (duplicate) delay = Math.max(delay, DUPLICATE_QUIET_MS)
+    this.#scheduleDial(peer, delay)
+    this.#logger.debug(`[peer-manager] reconnect ${peer.nodeId} in ${delay}ms (${reason})`)
+  }
+
+  /** @param {string} peerNodeId @returns {number} */
+  #nextBackoff(peerNodeId) {
+    const attempt = this.#dialAttempts.get(peerNodeId) ?? 0
+    const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]
+    this.#dialAttempts.set(peerNodeId, attempt + 1)
+    return delay
+  }
+
+  /** @param {any} peer @param {number} delay */
+  #scheduleDial(peer, delay) {
+    if (!this.#started) return
+    this.#clearDialTimer(peer.nodeId)
+    const timer = setTimeout(() => {
+      this.#dialTimers.delete(peer.nodeId)
+      this.#dial(peer).catch(error => this.#logger.warn(`[peer-manager] reconnect dial ${peer.nodeId} failed`, error))
+    }, Math.max(0, delay))
+    timer.unref?.()
+    this.#dialTimers.set(peer.nodeId, timer)
+  }
+
+  /** @param {string} peerNodeId */
+  #clearDialTimer(peerNodeId) {
+    const timer = this.#dialTimers.get(peerNodeId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      this.#dialTimers.delete(peerNodeId)
+    }
+  }
+
+  /**
+   * 找到一个自己发起的、尚未关闭的该 peer 链路（用于避免并发重复拨号）。
+   * @param {string} peerNodeId
+   * @returns {any|undefined}
+   */
+  #openOutboundLink(peerNodeId) {
+    for (const link of this.#links) {
+      if (link.state === 'closed') continue
+      if (link.direction === 'outbound' && link.peerNodeId === peerNodeId) return link
+    }
+    return undefined
+  }
+
+  // =====================================================================
+  // 拨号
+  // =====================================================================
+
+  /**
+   * 拨号：同一 peer 同时只允许一个拨号任务；建立 TCP 后创建 dialer peer-link，
+   * 握手在 link 内部继续（不等待 ready）。
+   * @param {any} peer
+   * @returns {Promise<any|null>}
+   */
+  #dial(peer) {
+    if (!this.#started) return Promise.resolve(null)
+    const existing = this.#openOutboundLink(peer.nodeId)
+    if (existing !== undefined) return Promise.resolve(existing)
+    const inFlight = this.#dialing.get(peer.nodeId)
+    if (inFlight !== undefined) return inFlight
+    const promise = this.#doDial(peer)
+    this.#dialing.set(peer.nodeId, promise)
+    return promise.finally(() => {
+      this.#dialing.delete(peer.nodeId)
+    })
+  }
+
+  /** @param {any} peer @returns {Promise<any|null>} */
+  async #doDial(peer) {
+    this.#clearDialTimer(peer.nodeId)
+    const entry = this.#entries.get(peer.nodeId)
+    if (entry !== undefined) {
+      entry.state = 'dialing'
+      entry.error = null
+    }
+    const socket = new Socket()
+    try {
+      socket.setNoDelay?.(true)
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          socket.off('error', onError)
+          socket.off('connect', onConnect)
+        }
+        const onError = error => {
+          cleanup()
+          reject(error)
+        }
+        const onConnect = () => {
+          cleanup()
+          resolve(undefined)
+        }
+        socket.once('error', onError)
+        socket.once('connect', onConnect)
+        try {
+          socket.connect({ host: peer.host, port: peer.port })
+        } catch (error) {
+          cleanup()
+          reject(error)
+        }
+      })
+    } catch (error) {
+      try {
+        socket.destroy()
+      } catch {
+        /* ignore */
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      const code = error?.code !== undefined ? String(error.code) : ''
+      if (entry !== undefined) {
+        entry.state = 'error'
+        entry.error = `connect failed${code ? ` (${code})` : ''}: ${message}`
+      }
+      this.#logger.warn(`[peer-manager] dial ${peer.nodeId} ${peer.host}:${peer.port} failed: ${message}`)
+      if (this.#started && peer.dial === 'auto' && !this.#readyLinks.has(peer.nodeId)) {
+        this.#scheduleDial(peer, this.#nextBackoff(peer.nodeId))
+      }
+      return null
+    }
+    if (!this.#started) {
+      try {
+        socket.destroy()
+      } catch {
+        /* ignore */
+      }
+      return null
+    }
+    let link
+    try {
+      link = createPeerLink({
+        socket,
+        role: 'dialer',
+        nodeId: this.#self.nodeId,
+        peerNodeId: peer.nodeId,
+        linkId: this.#canonicalLinkId(peer.nodeId),
+        secret: peer.secret,
+        secretFor: peerNodeId => this.#secretFor(peerNodeId),
+        nodeName: this.#self.nodeName,
+        instanceEpoch: this.#self.instanceEpoch,
+        platform: this.#self.platform,
+        ...(this.#capabilities === undefined ? {} : { capabilities: this.#capabilities }),
+        logger: this.#logger,
+        requestTimeoutMs: this.#requestTimeoutMs,
+        heartbeatIntervalMs: this.#heartbeatIntervalMs,
+        heartbeatTimeoutMs: this.#heartbeatTimeoutMs,
+        nonceCache: this.#nonceCache,
+        handlers: this.#linkHandlers(),
+      })
+    } catch (error) {
+      const protocol = asProtocolError(error)
+      this.#logger.warn(`[peer-manager] dial ${peer.nodeId} link setup failed: ${protocol.message}`)
+      try {
+        socket.destroy()
+      } catch {
+        /* ignore */
+      }
+      if (entry !== undefined) {
+        entry.state = 'error'
+        entry.error = protocol.message
+      }
+      if (this.#started && peer.dial === 'auto') this.#scheduleDial(peer, this.#nextBackoff(peer.nodeId))
+      return null
+    }
+    this.#links.add(link)
+    this.#logger.debug(`[peer-manager] dialed ${peer.nodeId} (${peer.host}:${peer.port}) as ${link.linkId}`)
+    return link
+  }
+
+  // =====================================================================
+  // rtt 测量
+  // =====================================================================
+
+  /** 链路 up 后立即 ping 一次，之后每 rttIntervalMs 一次；ping 失败只记日志。 */
+  #startPing(link) {
+    this.#stopPing(link)
+    const peerNodeId = link.peerNodeId
+    const tick = () => {
+      if (!link.isReady() || this.#readyLinks.get(peerNodeId) !== link) return
+      const startedAt = Date.now()
+      link.request('peer.ping', {}, { timeoutMs: Math.min(this.#requestTimeoutMs, 5000) })
+        .then(() => {
+          if (!link.isReady() || this.#readyLinks.get(peerNodeId) !== link) return
+          const entry = this.#entries.get(peerNodeId)
+          if (entry !== undefined) {
+            entry.rttMs = Math.max(0, Date.now() - startedAt)
+            entry.lastSeen = link.lastSeen
+          }
+        })
+        .catch(error => {
+          // ping 超时/失败不代表链路已死：心跳负责判死，这里只记 debug。
+          this.#logger.debug(
+            `[peer-manager] peer.ping ${peerNodeId} failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
+    }
+    tick()
+    const interval = Math.max(50, this.#rttIntervalMs)
+    const timer = setInterval(tick, interval)
+    timer.unref?.()
+    this.#pingTimers.set(link, timer)
+  }
+
+  /** @param {any} link */
+  #stopPing(link) {
+    const timer = this.#pingTimers.get(link)
+    if (timer !== undefined) {
+      clearInterval(timer)
+      this.#pingTimers.delete(link)
+    }
+  }
+
+  // =====================================================================
+  // 日志
+  // =====================================================================
+
+  /** @param {'debug'|'info'|'warn'|'error'} level */
+  #log(level, ...args) {
+    this.#logger[level](...args)
+  }
+}
+
+/**
+ * 归一化 remote 视图给 UI：{nodeId, nodeName, platform}。
+ * @param {any} remote
+ * @param {string} peerNodeId
+ * @param {string} fallbackName
+ */
+function normalizeRemote(remote, peerNodeId, fallbackName) {
+  if (!isRecord(remote)) return null
+  return {
+    nodeId: typeof remote.nodeId === 'string' ? remote.nodeId : peerNodeId,
+    nodeName: typeof remote.nodeName === 'string' ? remote.nodeName : fallbackName,
+    platform: typeof remote.platform === 'string' ? remote.platform : 'unknown',
+  }
+}
+
+/**
+ * 创建对等连接管理器（SPEC §5.9）。
+ * @param {object} options
+ * @param {Record<string, any>} options.config
+ * @param {string} [options.instanceEpoch]
+ * @param {object} [options.logger]
+ * @param {object} [options.handlers]
+ * @param {import('./handshake.js').NonceCache} [options.nonceCache]
+ * @returns {PeerManager}
+ */
+export function createPeerManager(options) {
+  return new PeerManager(options)
+}
+
+export { PeerManager }
+
+export default createPeerManager
