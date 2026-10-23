@@ -2,7 +2,7 @@
 
 > 状态：**已实现并通过双实例端到端验证**（2026-10-23）。
 > 关联设计：[06 · Remote Node 总体设计](06-remotenode-design.zh.md) · [07 · 协议 v1 规格](07-remotenode-m0-protocol.zh.md)。
-> 代码：[plugins/remotenode/](../plugins/remotenode/README.md)。
+> 代码：[plugins/remotenode/](../plugins/remotenode/README.md) · 公开仓库：<https://github.com/telunsu1999/dsh-design>
 
 ## 1. 与「刚才那版」的差别
 

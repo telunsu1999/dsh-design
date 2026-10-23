@@ -1,5 +1,7 @@
 # DSH 分布式 Worker：大脑节点 + 高性能台式机
 
+> 📦 代码仓库（公开）：<https://github.com/telunsu1999/dsh-design> —— 含 Remote Node 插件、设计文档与验收记录。
+
 > 目标：本机（Linux 服务器）继续充当 **大脑**——模型调用、Web UI、会话与编排都在这里；把家里性能更强的 **Windows 台式机** 作为 **worker 节点**，由大脑按任务委托生图（ComfyUI）、Blender 建模/渲染等重型任务。
 >
 > **✅ 插件模式实现（2026-10-23，v2 对等模型）**：**Remote Node 远程节点插件**已按设计 [docs/06](docs/06-remotenode-design.zh.md) / [docs/07](docs/07-remotenode-m0-protocol.zh.md) 实现为**可安装 DSH bundle**（Host + Client 半端，不改 DSH 源码、不写补丁脚本），并通过**双 DSH 实例真实端到端验证**：双向建远程会话、事件回传、断线续传、双向交付物同步、Web「远程节点」面板、模型工具 `remotenode`。用法见 [plugins/remotenode/README.md](plugins/remotenode/README.md)，实现与验收记录见 [docs/08](docs/08-remotenode-plugin.zh.md)。
@@ -9,8 +11,12 @@
 ## 插件模式（当前推荐）
 
 ```bash
-# 1) 安装 bundle 到当前 web profile（在 DSH 会话里执行）
-#    plugin_manager(action: install_bundle, target: /root/AiWork/DSH_Design/plugins/remotenode)
+# 1) 安装 bundle 到当前 web profile
+#    本机：plugin_manager(action: install_bundle, target: /root/AiWork/DSH_Design/plugins/remotenode)
+#    其他机器（从 GitHub）：
+#      dsh plugin --profile web add "github:telunsu1999/dsh-design#path:/plugins/remotenode"
+#      然后在插件管理里启用 @dsh-design/remotenode（或把 "@dsh-design/remotenode" 加进
+#      ~/.dsh/profiles/web/package.json 的 dsh.profile.bundles，重启 dsh web）
 # 2) 配 $DSH_HOME/remotenode/config.json（nodeId / listen / peers / secret）
 # 3) 第二节点：bash plugins/remotenode/scripts/setup-node-profile.sh
 #      然后 bash plugins/remotenode/scripts/run-node.sh

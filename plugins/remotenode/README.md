@@ -29,6 +29,26 @@
 
 ## 安装
 
+### 0) 在另一台机器上从 GitHub 安装（公开仓库）
+
+仓库：<https://github.com/telunsu1999/dsh-design>（插件在 `plugins/remotenode/` 子目录）
+
+```bash
+# 方式 A：dsh CLI 从 GitHub 子目录安装（已在本机用一次性 DSH_HOME 验证）
+dsh plugin --profile web add "github:telunsu1999/dsh-design#path:/plugins/remotenode"
+# 然后在插件管理页启用 @dsh-design/remotenode；
+# 或手动把 "@dsh-design/remotenode" 追加到 ~/.dsh/profiles/web/package.json 的 dsh.profile.bundles
+#（位于 @deepseek-ai/dsh-web-app 之后），再重启 dsh web。
+```
+
+```bash
+# 方式 B：git clone 后按本地路径安装（任何方式都能跑，含离线/内网）
+git clone https://github.com/telunsu1999/dsh-design.git
+# 在 DSH 会话里：plugin_manager(action: install_bundle, target: /path/to/dsh-design/plugins/remotenode)
+```
+
+> 仓库里只有源码与文档；运行时配置/密钥仍在各自机器的 `$DSH_HOME/remotenode/`，不会随仓库分发。
+
 ### 1) 装到「大脑」当前 profile（推荐用 Plugin Manager / 插件管理）
 
 ```bash
