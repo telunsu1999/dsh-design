@@ -148,9 +148,14 @@ async function startOnlinePair(options = {}) {
   const pair = await createPair(options)
   await Promise.all([pair.a.start(), pair.b.start()])
   if ((options.dial ?? 'off') === 'auto') {
+    // 默认 nodeIds：brain-test < desk-test，canonical dialer 是 A；等两侧都收敛到
+    // canonical 方向（竞态时可能先短暂落在非 canonical 方向，manager 会补偿拨号升级）。
     await waitFor(
-      () => pair.a.activeLinkCount() === 1 && pair.b.activeLinkCount() === 1,
-      { label: 'pair online (auto dial)' },
+      () => pair.a.activeLinkCount() === 1
+        && pair.b.activeLinkCount() === 1
+        && pair.a.linkFor(pair.nodeIds[1])?.direction === 'outbound'
+        && pair.b.linkFor(pair.nodeIds[0])?.direction === 'inbound',
+      { label: 'pair online (auto dial, canonical direction)', timeoutMs: 12000 },
     )
   }
   return pair
@@ -679,5 +684,214 @@ test('peer-link：未知方法 method/not-found、close 清理 pending、sendBin
       /* ignore */
     }
     await new Promise(resolve => server.close(resolve))
+  }
+})
+
+// =====================================================================
+// 7. onRawConnection：配对连接接管 / 普通对等连接放行 / hook 抛错兜底
+// =====================================================================
+
+test('onRawConnection：hook 接管配对魔数连接、unshift+proceed 放行普通握手、hook 抛错按 false 兜底', async () => {
+  /** @type {Array<{type:string, firstByte:number}>} */
+  const hookEvents = []
+  /** @param {string} label */
+  const echoHandler = label => (link, method, params) => (method === 'echo' ? { by: link.nodeId, params } : undefined)
+
+  const pair = await createPair({
+    dial: 'off',
+    buildHandlers: label => (label === 'b'
+      ? {
+          // listener 侧 raw connection hook：先读首字节判断「配对连接(R)」还是「普通对等帧」。
+          onRawConnection: (socket, proceed) => {
+            let decided = false
+            const onData = chunk => {
+              if (decided || chunk.length === 0) return
+              decided = true
+              socket.off('data', onData)
+              hookEvents.push({ type: chunk[0] === 0x52 ? 'takeover' : 'proceed', firstByte: chunk[0] })
+              if (chunk[0] === 0x52) {
+                // 配对连接：本 hook 接管，自己关闭 socket（不进入 PeerLink 握手）。
+                socket.destroy()
+                return
+              }
+              // 普通对等连接：把读掉的字节 unshift 回去，再 proceed 继续正常握手。
+              socket.unshift(chunk)
+              proceed()
+            }
+            socket.on('data', onData)
+            return true
+          },
+          onRequest: echoHandler('b'),
+        }
+      : { onRequest: echoHandler('a') }),
+  })
+  /** @type {Array<Awaited<ReturnType<typeof createPair>>>} */
+  const pairs = [pair]
+  try {
+    await Promise.all([pair.a.start(), pair.b.start()])
+
+    // (1) 普通对等连接：hook 返回 true → 读字节 → unshift + proceed → 正常握手完成。
+    await pair.a.dialNow('desk-test')
+    await waitFor(
+      () => pair.a.activeLinkCount() === 1 && pair.b.activeLinkCount() === 1,
+      { label: 'peer link established through raw hook' },
+    )
+    assert.ok(hookEvents.some(event => event.type === 'proceed'), 'hook must have called proceed for a peer connection')
+    assert.notEqual(hookEvents.find(event => event.type === 'proceed').firstByte, 0x52)
+    assert.deepEqual(
+      await pair.a.linkFor('desk-test').request('echo', { x: 1 }),
+      { by: 'desk-test', params: { x: 1 } },
+    )
+
+    // (2) 配对连接：客户端发 1B 魔数 'R' + 一行 JSON → hook 接管并关闭，不影响已有链路。
+    const client = netConnect({ host: '127.0.0.1', port: pair.b.listenPort })
+    client.on('error', () => {})
+    const clientClosed = new Promise(resolve => client.once('close', resolve))
+    client.write(Buffer.concat([Buffer.from([0x52]), Buffer.from('{"v":1,"type":"pair.request"}\n')]))
+    await waitFor(() => hookEvents.some(event => event.type === 'takeover'), { label: 'pairing hook takeover' })
+    await Promise.race([
+      clientClosed,
+      sleep(3000).then(() => {
+        throw new Error('hook did not close the pairing socket')
+      }),
+    ])
+    assert.equal(pair.a.activeLinkCount(), 1, 'pairing takeover must not disturb the existing peer link')
+    assert.equal(pair.b.activeLinkCount(), 1)
+
+    // (3) hook 抛异常 → 按 false 处理，正常对等握手仍应成功。
+    const fallback = await createPair({
+      dial: 'off',
+      buildHandlers: label => ({
+        onRawConnection: () => {
+          throw new Error('hook boom')
+        },
+        onRequest: echoHandler(label),
+      }),
+    })
+    pairs.push(fallback)
+    await Promise.all([fallback.a.start(), fallback.b.start()])
+    await fallback.a.dialNow('desk-test')
+    await waitFor(
+      () => fallback.a.activeLinkCount() === 1 && fallback.b.activeLinkCount() === 1,
+      { label: 'handshake fallback after hook throws', timeoutMs: 6000 },
+    )
+    assert.deepEqual(
+      await fallback.a.linkFor('desk-test').request('echo', { y: 2 }),
+      { by: 'desk-test', params: { y: 2 } },
+    )
+  } finally {
+    await Promise.allSettled(pairs.map(item => item.stop()))
+  }
+})
+
+// =====================================================================
+// 8. addPeer / removePeer 运行时增删 + state 的 source/removable
+// =====================================================================
+
+test('addPeer 自动拨号建链（source=paired）、removePeer 关链且不再重拨、state 透传 source/removable', async () => {
+  const secret = randomBytes(32).toString('hex')
+  const [portA, portB] = [await freePort(), await freePort()]
+  const tuning = {
+    requestTimeoutMs: 2000,
+    heartbeatIntervalMs: 100,
+    heartbeatTimeoutMs: 1500,
+    rttIntervalMs: 100,
+  }
+  // B 是配置节点（source 缺省 config），只等 A 拨入；A 初始没有 peer，运行时 addPeer。
+  const b = createPeerManager({
+    config: {
+      nodeId: 'desk-test',
+      nodeName: 'desk-test',
+      listen: { enabled: true, host: '127.0.0.1', port: portB },
+      peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: portA, secret, dial: 'off' }],
+      ...tuning,
+    },
+    instanceEpoch: 'desk-test-epoch',
+    logger: silentLogger(),
+  })
+  const a = createPeerManager({
+    config: {
+      nodeId: 'brain-test',
+      nodeName: 'brain-test',
+      listen: { enabled: true, host: '127.0.0.1', port: portA },
+      peers: [],
+      ...tuning,
+    },
+    instanceEpoch: 'brain-test-epoch',
+    logger: silentLogger(),
+  })
+  const pairedPeer = {
+    nodeId: 'desk-test',
+    nodeName: 'desk-paired',
+    host: '127.0.0.1',
+    port: portB,
+    secret,
+    dial: 'auto',
+    source: 'paired',
+    addedAt: Date.now(),
+  }
+  try {
+    await Promise.all([a.start(), b.start()])
+    assert.equal(a.state().length, 0)
+
+    // 非法 addPeer：self / 非法端口 → null（不抛、不新增条目）。
+    assert.equal(a.addPeer({ ...pairedPeer, nodeId: 'brain-test' }), null)
+    assert.equal(a.addPeer({ ...pairedPeer, port: 0 }), null)
+    assert.equal(a.state().length, 0)
+
+    // (1) 运行时 addPeer(source:'paired') → 立即自动拨号建链。
+    const added = a.addPeer(pairedPeer)
+    assert.ok(added !== null, 'addPeer must return the normalized peer')
+    assert.equal(added.nodeId, 'desk-test')
+    assert.equal(added.source, 'paired')
+    await waitFor(
+      () => a.activeLinkCount() === 1 && b.activeLinkCount() === 1,
+      { label: 'link established after addPeer' },
+    )
+
+    const [rowA] = a.state()
+    assert.equal(rowA.peerNodeId, 'desk-test')
+    assert.equal(rowA.nodeName, 'desk-paired')
+    assert.equal(rowA.state, 'online')
+    assert.equal(rowA.direction, 'out')
+    assert.equal(rowA.source, 'paired')
+    assert.equal(rowA.removable, true)
+    const [rowB] = b.state()
+    assert.equal(rowB.peerNodeId, 'brain-test')
+    assert.equal(rowB.source, 'config')
+    assert.equal(rowB.removable, false)
+    assert.equal(rowB.state, 'online')
+
+    // (2) 同 nodeId 再 addPeer（连接参数不变）→ 去重更新（只有一行）、链路不重建。
+    const linkBeforeUpdate = a.linkFor('desk-test')
+    const updated = a.addPeer({ ...pairedPeer, nodeName: 'desk-paired-2' })
+    assert.ok(updated !== null)
+    assert.equal(a.state().length, 1)
+    assert.equal(a.state()[0].nodeName, 'desk-paired-2')
+    await sleep(250)
+    assert.equal(a.linkFor('desk-test'), linkBeforeUpdate, 'unchanged config must keep the existing link')
+
+    // (3) removePeer → 链路关闭、state 清空、超过一次退避窗口后仍不重拨。
+    assert.equal(a.removePeer('desk-test'), true)
+    await waitFor(() => a.activeLinkCount() === 0, { label: 'link closed after removePeer' })
+    assert.equal(a.state().length, 0)
+    await waitFor(() => b.state()[0].state !== 'online', {
+      label: 'peer side observes link down',
+      timeoutMs: 3000,
+    })
+    await sleep(1800) // > 1s 首个退避档：确认 dial:'auto' 循环已停止
+    assert.equal(a.activeLinkCount(), 0, 'removed peer must not be re-dialed')
+    assert.equal(b.activeLinkCount(), 0)
+    assert.equal(a.removePeer('desk-test'), false, 'removePeer must be idempotent')
+
+    // (4) 重新 addPeer → 再次自动建链（不需要重启 manager）。
+    assert.ok(a.addPeer(pairedPeer) !== null)
+    await waitFor(
+      () => a.activeLinkCount() === 1 && b.activeLinkCount() === 1,
+      { label: 'link re-established after re-addPeer' },
+    )
+    assert.equal(a.state()[0].source, 'paired')
+  } finally {
+    await Promise.allSettled([a.stop(), b.stop()])
   }
 })

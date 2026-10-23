@@ -161,6 +161,54 @@ window.__ModuleLoader__.load({
       emptyValue: '—',
       configFileHint: '$DSH_HOME/remotenode/config.json',
       configWarnings: '配置警告',
+      pairingTitle: '配对令牌',
+      pairingHint: '在对端面板的「配对令牌」中复制该令牌即可完成配对。',
+      fingerprint: '指纹',
+      showToken: '显示',
+      hideToken: '隐藏',
+      copyToken: '复制',
+      copied: '已复制',
+      copyFailed: '复制失败，请手动选择令牌复制',
+      rotateToken: '轮换',
+      rotating: '轮换中…',
+      tokenRotated: '配对令牌已轮换',
+      fixedByConfig: '令牌由 config.json 固定，不可轮换',
+      addNode: '添加节点',
+      addNodeTitle: '添加远程节点',
+      addNodeHint: '输入对端的地址、端口与对端面板显示的配对令牌。配对可能需要几秒钟，请勿重复提交。',
+      nodeNameOptional: '名称（可选）',
+      nodeNamePlaceholder: '例如：台式机 worker',
+      nodeAddress: '地址（IP / 域名）',
+      nodeAddressPlaceholder: '例如：10.0.0.5 或 desktop.example.com',
+      nodePort: '端口',
+      nodePortPlaceholder: '例如：47301',
+      nodeToken: '配对令牌',
+      nodeTokenPlaceholder: '粘贴对端面板显示的配对令牌',
+      startPairing: '发起配对',
+      pairing: '配对中…',
+      pairSuccess: '已添加节点',
+      needHost: '请填写对端地址',
+      needPort: '请填写有效端口（1-65535）',
+      needToken: '请填写配对令牌',
+      pendingPairs: '配对请求',
+      pendingPairsHint: '以下节点正在请求与本机配对，批准后会建立并持久化链路。',
+      pendingFrom: '来源',
+      listenPortLabel: '监听端口',
+      approve: '批准',
+      reject: '拒绝',
+      approving: '批准中…',
+      rejecting: '拒绝中…',
+      pairApproved: '已批准配对',
+      pairRejected: '已拒绝配对',
+      sourceLabel: '来源',
+      sourceConfig: '配置',
+      sourcePaired: '已配对',
+      removeNode: '删除',
+      removeConfirm: '删除该节点？',
+      removeConfirmHint: '将关闭链路并删除已持久化的节点。',
+      confirmRemove: '确认删除',
+      removing: '删除中…',
+      nodeRemoved: '已删除节点',
     }
     const EN = {
       nav: 'Remote node',
@@ -276,7 +324,55 @@ window.__ModuleLoader__.load({
       sessionGone: 'The session may no longer exist; go back and refresh the list.',
       emptyValue: '—',
       configFileHint: '$DSH_HOME/remotenode/config.json',
-      configWarnings: '配置警告',
+      configWarnings: 'Config warnings',
+      pairingTitle: 'Pairing token',
+      pairingHint: 'Copy this token from the peer\'s "Pairing token" section to pair.',
+      fingerprint: 'Fingerprint',
+      showToken: 'Show',
+      hideToken: 'Hide',
+      copyToken: 'Copy',
+      copied: 'Copied',
+      copyFailed: 'Copy failed, select the token manually',
+      rotateToken: 'Rotate',
+      rotating: 'Rotating…',
+      tokenRotated: 'Pairing token rotated',
+      fixedByConfig: 'Token is fixed by config.json and cannot be rotated',
+      addNode: 'Add node',
+      addNodeTitle: 'Add remote node',
+      addNodeHint: 'Enter the peer address, port and the pairing token shown on its panel. Pairing may take a few seconds; do not submit twice.',
+      nodeNameOptional: 'Name (optional)',
+      nodeNamePlaceholder: 'e.g. Desktop worker',
+      nodeAddress: 'Address (IP / hostname)',
+      nodeAddressPlaceholder: 'e.g. 10.0.0.5 or desktop.example.com',
+      nodePort: 'Port',
+      nodePortPlaceholder: 'e.g. 47301',
+      nodeToken: 'Pairing token',
+      nodeTokenPlaceholder: 'Paste the pairing token shown on the peer panel',
+      startPairing: 'Pair',
+      pairing: 'Pairing…',
+      pairSuccess: 'Node added',
+      needHost: 'Enter the peer address',
+      needPort: 'Enter a valid port (1-65535)',
+      needToken: 'Enter the pairing token',
+      pendingPairs: 'Pairing requests',
+      pendingPairsHint: 'These peers are requesting to pair with this node; approving creates and persists the link.',
+      pendingFrom: 'From',
+      listenPortLabel: 'Listen port',
+      approve: 'Approve',
+      reject: 'Reject',
+      approving: 'Approving…',
+      rejecting: 'Rejecting…',
+      pairApproved: 'Pairing approved',
+      pairRejected: 'Pairing rejected',
+      sourceLabel: 'Source',
+      sourceConfig: 'Config',
+      sourcePaired: 'Paired',
+      removeNode: 'Remove',
+      removeConfirm: 'Remove this node?',
+      removeConfirmHint: 'This closes the link and deletes the persisted peer.',
+      confirmRemove: 'Confirm remove',
+      removing: 'Removing…',
+      nodeRemoved: 'Node removed',
     }
 
     /** 当前翻译函数；locale 服务就绪前用 zh 回退。 */
@@ -602,6 +698,8 @@ window.__ModuleLoader__.load({
           platform: asText(remote.platform),
         },
         error: item.error === null || item.error === undefined ? '' : asText(item.error),
+        source: item.source === 'paired' ? 'paired' : 'config',
+        removable: item.removable === true,
         key: id === '' ? 'peer-' + String(index) : id,
       }
     }
@@ -649,6 +747,31 @@ window.__ModuleLoader__.load({
         rowKey: key === '' ? 'deliverable-' + String(index) : key,
       }
     }
+    /** 本机配对令牌（v1.1 §10.3；Host 未提供时为 null，面板隐藏该区块）。 */
+    function normalizePairing(value) {
+      if (!isObject(value)) return null
+      return {
+        token: asText(value.token),
+        fingerprint: asText(value.fingerprint),
+        createdAt: numOrNull(value.createdAt),
+        fixedByConfig: value.fixedByConfig === true,
+      }
+    }
+    /** 一条待审批的配对请求（v1.1 §10.3）。 */
+    function normalizePendingPair(value, index) {
+      const item = isObject(value) ? value : {}
+      const requestId = asText(item.requestId)
+      return {
+        requestId: requestId,
+        nodeId: asText(item.nodeId),
+        nodeName: asText(item.nodeName),
+        remoteAddress: asText(item.remoteAddress),
+        remotePort: numOrNull(item.remotePort),
+        listenPort: numOrNull(item.listenPort),
+        createdAt: numOrNull(item.createdAt),
+        key: requestId === '' ? 'pair-' + String(index) : requestId,
+      }
+    }
     function normalizeSnapshot(body) {
       const source = isObject(body) ? body : {}
       return {
@@ -656,6 +779,8 @@ window.__ModuleLoader__.load({
         peers: asArray(source.peers).map(normalizePeer),
         sessions: asArray(source.sessions).map(normalizeSession),
         deliverables: asArray(source.deliverables).map(normalizeDeliverable),
+        pairing: normalizePairing(source.pairing),
+        pendingPairs: asArray(source.pendingPairs).map(normalizePendingPair),
         warnings: asArray(source.warnings).map(function (item) {
           return asText(item)
         }).filter(function (text) {
@@ -904,6 +1029,31 @@ window.__ModuleLoader__.load({
 .rn-composer-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .rn-hint { font-size: 10.5px; color: var(--dsw-alias-label-tertiary); margin-right: auto; }
 .rn-center { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; }
+.rn-btn-sm { font-size: 11px; line-height: 1.5; padding: 2px 8px; border-radius: 6px; }
+.rn-pairing { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); box-sizing: border-box; }
+.rn-pairing-label { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.rn-token { flex: 1 1 240px; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5; letter-spacing: .5px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); border-radius: 7px; padding: 4px 8px; overflow-wrap: anywhere; user-select: all; }
+.rn-token-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: none; }
+.rn-pairing-fp { font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.rn-pairing-hint { flex-basis: 100%; font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); overflow-wrap: anywhere; }
+.rn-pair-requests { display: flex; flex-direction: column; gap: 8px; }
+.rn-pair-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 9px 12px; border: 1px solid var(--dsw-alias-state-business-primary); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); box-sizing: border-box; }
+.rn-pair-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 240px; }
+.rn-pair-name { font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rn-pair-meta { font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.rn-pair-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: none; }
+.rn-source-tag { font-size: 10.5px; line-height: 1.5; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
+.rn-source-tag-paired { border-color: var(--dsw-alias-state-business-primary); color: var(--dsw-alias-state-business-primary); }
+.rn-link-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.rn-remove-confirm { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+.rn-btn-danger { border-color: var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); }
+.rn-btn-danger:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-2); }
+.rn-modal-backdrop { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--dsw-alias-bg-mask-1); }
+.rn-modal { display: flex; flex-direction: column; gap: 10px; width: min(480px, 100%); max-height: calc(100vh - 48px); overflow-y: auto; padding: 16px 18px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 14px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 12px 40px var(--dsw-alias-bg-mask-drop); box-sizing: border-box; }
+.rn-modal-title { font-size: 15px; line-height: 22px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.rn-modal-hint { font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
+.rn-modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.rn-token-input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .5px; }
 `
 
     /** 唯一的样式注入点：一个 React <style> 元素（不碰 document.head/body）。 */
@@ -939,7 +1089,165 @@ window.__ModuleLoader__.load({
       return t('updatedAt') + ' ' + fmtClock(num)
     }
 
-    function renderLinkCard(peer) {
+    /** 令牌掩码：默认不渲染任何真实字符。 */
+    function maskedToken() {
+      return '••••••••••••••••'
+    }
+    /** 节点来源标签文案。 */
+    function peerSourceText(peer) {
+      return peer && peer.source === 'paired' ? t('sourcePaired') : t('sourceConfig')
+    }
+
+    /**
+     * 配对令牌条（v1.1 §10.5）：默认掩码，可显示/复制；未由 config 固定时可轮换。
+     * pairing 为 null（Host 未提供该字段）时整块隐藏，保持对旧 Host 的兼容。
+     */
+    function renderPairingBar(pairing, opts) {
+      if (!pairing) return null
+      const token = pairing.token
+      const visible = opts.visible === true && token !== ''
+      const rotating = opts.busy === 'rotate'
+      const children = [
+        h('span', { key: 'label', className: 'rn-pairing-label' }, t('pairingTitle')),
+        h('span', {
+          key: 'token',
+          className: 'rn-token',
+          title: visible ? token : t('pairingHint'),
+        }, visible ? token : maskedToken()),
+      ]
+      if (pairing.fingerprint !== '') {
+        children.push(h('span', { key: 'fp', className: 'rn-pairing-fp', title: pairing.fingerprint },
+          t('fingerprint') + ' ' + shortId(pairing.fingerprint, 32)))
+      }
+      children.push(h('div', { key: 'actions', className: 'rn-token-actions' },
+        h('button', {
+          type: 'button',
+          className: 'rn-btn rn-btn-sm',
+          disabled: token === '',
+          onClick: opts.onToggle,
+        }, visible ? t('hideToken') : t('showToken')),
+        h('button', {
+          type: 'button',
+          className: 'rn-btn rn-btn-sm',
+          disabled: token === '',
+          onClick: opts.onCopy,
+        }, t('copyToken')),
+        h('button', {
+          type: 'button',
+          className: 'rn-btn rn-btn-sm',
+          disabled: pairing.fixedByConfig || rotating,
+          title: pairing.fixedByConfig ? t('fixedByConfig') : '',
+          onClick: opts.onRotate,
+        }, rotating ? t('rotating') : t('rotateToken'))))
+      children.push(h('span', { key: 'hint', className: 'rn-pairing-hint' },
+        pairing.fixedByConfig ? t('fixedByConfig') : t('pairingHint')))
+      return h('section', { className: 'rn-section', key: 'pairing' },
+        h('div', { className: 'rn-pairing' }, children))
+    }
+
+    /** 待审批的配对请求卡片（v1.1 §10.5）：仅 pendingPairs 非空时显示。 */
+    function renderPendingPairsSection(pairs, opts) {
+      if (!Array.isArray(pairs) || pairs.length === 0) return null
+      return h('section', { className: 'rn-section', key: 'pending-pairs' },
+        h('div', { className: 'rn-section-head' },
+          h('h3', { className: 'rn-section-title' }, t('pendingPairs')),
+          h('span', { className: 'rn-section-meta' }, String(pairs.length))),
+        h('div', { className: 'rn-pair-requests' }, pairs.map(function (pair) {
+          const approving = opts.busy === 'approve:' + pair.requestId
+          const rejecting = opts.busy === 'reject:' + pair.requestId
+          const disabled = pair.requestId === '' || approving || rejecting
+          const address = pair.remoteAddress !== ''
+            ? pair.remoteAddress + (pair.remotePort === null ? '' : ':' + String(pair.remotePort))
+            : t('emptyValue')
+          const meta = [t('pendingFrom') + ' ' + address]
+          if (pair.listenPort !== null) meta.push(t('listenPortLabel') + ' ' + String(pair.listenPort))
+          if (pair.createdAt !== null && pair.createdAt > 0) meta.push(fmtAgo(pair.createdAt))
+          return h('div', { className: 'rn-pair-card', key: pair.key },
+            h('div', { className: 'rn-pair-main' },
+              h('div', { className: 'rn-pair-name', title: pair.nodeId },
+                textOr(pair.nodeName, textOr(pair.nodeId, t('unknownPeer')))),
+              h('div', { className: 'rn-pair-meta' }, meta.join(' · '))),
+            h('div', { className: 'rn-pair-actions' },
+              h('button', {
+                type: 'button',
+                className: 'rn-btn rn-btn-sm rn-btn-primary',
+                disabled: disabled,
+                onClick: function () { opts.onApprove(pair) },
+              }, approving ? t('approving') : t('approve')),
+              h('button', {
+                type: 'button',
+                className: 'rn-btn rn-btn-sm',
+                disabled: disabled,
+                onClick: function () { opts.onReject(pair) },
+              }, rejecting ? t('rejecting') : t('reject'))))
+        })),
+        h('div', { className: 'rn-empty-hint' }, t('pendingPairsHint')))
+    }
+
+    /** 「添加节点」弹窗（v1.1 §10.5）：地址/端口/令牌/可选名称。 */
+    function renderAddNodeModal(opts) {
+      const pairingNow = opts.busy === 'pair'
+      return h('div', {
+        className: 'rn-modal-backdrop',
+        key: 'add-node-modal',
+        onMouseDown: function (event) {
+          if (!event) return
+          if (event.target === event.currentTarget) opts.onClose()
+        },
+      },
+      h('div', { className: 'rn-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('addNodeTitle') },
+        h('div', { className: 'rn-modal-title' }, t('addNodeTitle')),
+        h('div', { className: 'rn-modal-hint' }, t('addNodeHint')),
+        h('label', { className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('nodeNameOptional')),
+          h('input', {
+            className: 'rn-input',
+            type: 'text',
+            value: opts.name,
+            placeholder: t('nodeNamePlaceholder'),
+            onChange: opts.onNameChange,
+          })),
+        h('label', { className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('nodeAddress')),
+          h('input', {
+            className: 'rn-input',
+            type: 'text',
+            value: opts.host,
+            placeholder: t('nodeAddressPlaceholder'),
+            onChange: opts.onHostChange,
+          })),
+        h('label', { className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('nodePort')),
+          h('input', {
+            className: 'rn-input',
+            type: 'text',
+            inputMode: 'numeric',
+            value: opts.port,
+            placeholder: t('nodePortPlaceholder'),
+            onChange: opts.onPortChange,
+          })),
+        h('label', { className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('nodeToken')),
+          h('input', {
+            className: 'rn-input rn-token-input',
+            type: 'text',
+            value: opts.token,
+            placeholder: t('nodeTokenPlaceholder'),
+            onChange: opts.onTokenChange,
+            spellCheck: false,
+            autoComplete: 'off',
+          })),
+        h('div', { className: 'rn-modal-actions' },
+          h('button', { type: 'button', className: 'rn-btn', onClick: opts.onClose }, t('cancel')),
+          h('button', {
+            type: 'button',
+            className: 'rn-btn rn-btn-primary',
+            disabled: pairingNow,
+            onClick: opts.onSubmit,
+          }, pairingNow ? t('pairing') : t('startPairing')))))
+    }
+
+    function renderLinkCard(peer, opts) {
       const rows = []
       rows.push(h('span', { key: 'id', className: 'rn-kv' },
         h('span', { className: 'rn-k' }, 'ID'),
@@ -958,6 +1266,42 @@ window.__ModuleLoader__.load({
           h('span', { className: 'rn-k' }, 'Platform'),
           h('span', { className: 'rn-v' }, peer.remote.platform)))
       }
+      const actions = [
+        h('span', {
+          key: 'source',
+          className: 'rn-source-tag' + (peer.source === 'paired' ? ' rn-source-tag-paired' : ''),
+        }, peerSourceText(peer)),
+      ]
+      const confirmRemove = opts && opts.confirmRemove === peer.peerNodeId && peer.peerNodeId !== ''
+      if (peer.removable) {
+        if (confirmRemove) {
+          const removing = opts.busy === 'remove:' + peer.peerNodeId
+          actions.push(h('span', { key: 'confirm', className: 'rn-remove-confirm' },
+            h('span', null, t('removeConfirm')),
+            h('button', {
+              type: 'button',
+              className: 'rn-btn rn-btn-sm rn-btn-danger',
+              disabled: removing,
+              title: t('removeConfirmHint'),
+              onClick: function () { opts.onConfirmRemove(peer) },
+            }, removing ? t('removing') : t('confirmRemove')),
+            h('button', {
+              type: 'button',
+              className: 'rn-btn rn-btn-sm',
+              disabled: removing,
+              onClick: opts.onCancelRemove,
+            }, t('cancel'))))
+        } else {
+          actions.push(h('button', {
+            key: 'remove',
+            type: 'button',
+            className: 'rn-btn rn-btn-sm rn-btn-danger',
+            disabled: opts.busy === 'remove:' + peer.peerNodeId,
+            title: t('removeConfirmHint'),
+            onClick: function () { opts.onAskRemove(peer) },
+          }, t('removeNode')))
+        }
+      }
       return h('div', { className: 'rn-card', key: peer.key },
         h('div', { className: 'rn-link-head' },
           h('span', { className: peerDotClass(peer.state), title: peerStateText(peer.state) }),
@@ -966,15 +1310,18 @@ window.__ModuleLoader__.load({
           h('span', { className: 'rn-link-state' }, peerStateText(peer.state))),
         h('div', { className: 'rn-kv-grid' }, rows),
         peer.error !== '' ? h('div', { className: 'rn-card-error' }, peer.error) : null,
-        peer.linkId !== '' ? h('div', { className: 'rn-card-foot', title: peer.linkId }, peer.linkId) : null)
+        peer.linkId !== '' ? h('div', { className: 'rn-card-foot', title: peer.linkId }, peer.linkId) : null,
+        h('div', { className: 'rn-link-actions' }, actions))
     }
 
-    function renderLinksSection(peers) {
+    function renderLinksSection(peers, opts) {
       const body = peers.length === 0
         ? h('div', { className: 'rn-empty' },
           h('div', null, t('noPeers')),
           h('div', { className: 'rn-empty-hint' }, t('noPeersHint')))
-        : h('div', { className: 'rn-cards' }, peers.map(renderLinkCard))
+        : h('div', { className: 'rn-cards' }, peers.map(function (peer) {
+          return renderLinkCard(peer, opts)
+        }))
       return h('section', { className: 'rn-section', key: 'links' },
         h('div', { className: 'rn-section-head' },
           h('h3', { className: 'rn-section-title' }, t('links')),
@@ -1500,6 +1847,13 @@ window.__ModuleLoader__.load({
       const [publishPeer, setPublishPeer] = useState('')
       const [publishPath, setPublishPath] = useState('')
       const [publishDesc, setPublishDesc] = useState('')
+      const [addOpen, setAddOpen] = useState(false)
+      const [addName, setAddName] = useState('')
+      const [addHost, setAddHost] = useState('')
+      const [addPort, setAddPort] = useState('')
+      const [addToken, setAddToken] = useState('')
+      const [tokenVisible, setTokenVisible] = useState(false)
+      const [confirmRemove, setConfirmRemove] = useState('')
 
       const data = polling.data
       const reload = polling.reload
@@ -1523,6 +1877,8 @@ window.__ModuleLoader__.load({
       const peers = data ? data.peers : []
       const sessions = data ? data.sessions : []
       const deliverables = data ? data.deliverables : []
+      const pairing = data ? data.pairing : null
+      const pendingPairs = data ? data.pendingPairs : []
 
       function firstPeerId() {
         for (const peer of peers) {
@@ -1601,6 +1957,120 @@ window.__ModuleLoader__.load({
         if (typeof id !== 'string' || id === '') return
         setView(id)
         setFlash(null)
+      }
+
+      // —— v1.1 配对 / 审批 / 删除 ——
+
+      function onOpenAddNode() {
+        setAddOpen(true)
+        setFlash(null)
+      }
+
+      function onCloseAddNode() {
+        // 配对请求进行中（可能数秒）不允许关闭，避免用户误以为已取消。
+        if (busy === 'pair') return
+        setAddOpen(false)
+      }
+
+      function onPairSubmit() {
+        if (busy === 'pair') return
+        const host = addHost.trim()
+        const portText = addPort.trim()
+        const token = addToken.trim()
+        const port = Number(portText)
+        if (host === '') {
+          setFlash({ kind: 'error', text: t('needHost') })
+          return
+        }
+        if (!isFinite(port) || port <= 0 || port > 65535 || Math.floor(port) !== port) {
+          setFlash({ kind: 'error', text: t('needPort') })
+          return
+        }
+        if (token === '') {
+          setFlash({ kind: 'error', text: t('needToken') })
+          return
+        }
+        const payload = { host: host, port: port, token: token }
+        const nodeName = addName.trim()
+        if (nodeName !== '') payload.nodeName = nodeName
+        run('pair', function () { return apiPost('/peers/pair', payload) }, '').then(function (body) {
+          if (!body) return
+          const peer = isObject(body.peer) ? body.peer : null
+          const label = peer === null ? '' : textOr(peer.nodeName, textOr(peer.peerNodeId, ''))
+          setFlash({ kind: 'ok', text: t('pairSuccess') + (label !== '' ? '：' + label : '') })
+          setAddOpen(false)
+          setAddName('')
+          setAddHost('')
+          setAddPort('')
+          setAddToken('')
+        })
+      }
+
+      function onCopyToken() {
+        const token = pairing && typeof pairing.token === 'string' ? pairing.token : ''
+        if (token === '') return
+        function finish(ok) {
+          setFlash(ok ? { kind: 'ok', text: t('copied') } : { kind: 'error', text: t('copyFailed') })
+        }
+        try {
+          if (typeof navigator !== 'undefined' && navigator && navigator.clipboard
+            && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(token).then(function () { finish(true) }, function () { finish(false) })
+            return
+          }
+        } catch (error) {
+          // 落到失败提示。
+        }
+        finish(false)
+      }
+
+      function onToggleToken() {
+        setTokenVisible(tokenVisible !== true)
+      }
+
+      function onRotateToken() {
+        if (!pairing || pairing.fixedByConfig) return
+        if (busy === 'rotate') return
+        run('rotate', function () { return apiPost('/pairing/rotate', {}) }, t('tokenRotated'))
+      }
+
+      function onApprovePair(pair) {
+        if (!isObject(pair) || pair.requestId === '') return
+        const label = 'approve:' + pair.requestId
+        if (busy === label) return
+        run(label, function () {
+          return apiPost('/peers/approve', { requestId: pair.requestId, approve: true })
+        }, t('pairApproved'))
+      }
+
+      function onRejectPair(pair) {
+        if (!isObject(pair) || pair.requestId === '') return
+        const label = 'reject:' + pair.requestId
+        if (busy === label) return
+        run(label, function () {
+          return apiPost('/peers/approve', { requestId: pair.requestId, approve: false })
+        }, t('pairRejected'))
+      }
+
+      function onAskRemove(peer) {
+        if (!isObject(peer) || peer.peerNodeId === '') return
+        setConfirmRemove(peer.peerNodeId)
+        setFlash(null)
+      }
+
+      function onCancelRemove() {
+        setConfirmRemove('')
+      }
+
+      function onConfirmRemove(peer) {
+        if (!isObject(peer) || peer.peerNodeId === '') return
+        const label = 'remove:' + peer.peerNodeId
+        if (busy === label) return
+        run(label, function () {
+          return apiPost('/peers/remove', { peerNodeId: peer.peerNodeId })
+        }, t('nodeRemoved')).then(function (body) {
+          if (body) setConfirmRemove('')
+        })
       }
 
       const peerValue = pickPeer()
@@ -1692,6 +2162,11 @@ window.__ModuleLoader__.load({
             }, busy === 'refresh' ? t('refreshing') : t('refresh')),
             h('button', {
               type: 'button',
+              className: 'rn-btn' + (addOpen ? ' rn-btn-active' : ''),
+              onClick: onOpenAddNode,
+            }, t('addNode')),
+            h('button', {
+              type: 'button',
               className: 'rn-btn' + (openForm === 'start' ? ' rn-btn-active' : ''),
               onClick: function () { onToggleForm('start') },
             }, t('newSession')),
@@ -1705,16 +2180,59 @@ window.__ModuleLoader__.load({
         if (data === null && polling.error === '') {
           scrollChildren.push(h('div', { className: 'rn-empty', key: 'loading' }, t('loadingState')))
         }
-        scrollChildren.push(renderLinksSection(peers))
+        scrollChildren.push(renderPairingBar(pairing, {
+          visible: tokenVisible,
+          busy: busy,
+          onToggle: onToggleToken,
+          onCopy: onCopyToken,
+          onRotate: onRotateToken,
+        }))
+        scrollChildren.push(renderPendingPairsSection(pendingPairs, {
+          busy: busy,
+          onApprove: onApprovePair,
+          onReject: onRejectPair,
+        }))
+        scrollChildren.push(renderLinksSection(peers, {
+          busy: busy,
+          confirmRemove: confirmRemove,
+          onAskRemove: onAskRemove,
+          onCancelRemove: onCancelRemove,
+          onConfirmRemove: onConfirmRemove,
+        }))
         scrollChildren.push(renderSessionsSection(sessions, onOpenSession))
         scrollChildren.push(renderDeliverablesSection(deliverables, busy, onFetchArtifact))
+
+        const addModal = addOpen
+          ? renderAddNodeModal({
+            busy: busy,
+            name: addName,
+            host: addHost,
+            port: addPort,
+            token: addToken,
+            onNameChange: function (event) {
+              setAddName(event && event.target ? asText(event.target.value) : '')
+            },
+            onHostChange: function (event) {
+              setAddHost(event && event.target ? asText(event.target.value) : '')
+            },
+            onPortChange: function (event) {
+              setAddPort(event && event.target ? asText(event.target.value) : '')
+            },
+            onTokenChange: function (event) {
+              setAddToken(event && event.target ? asText(event.target.value) : '')
+            },
+            onSubmit: onPairSubmit,
+            onClose: onCloseAddNode,
+          })
+          : null
 
         return h('div', { className: 'rn-root' },
           StyleTag(),
           header,
           errorBars,
           forms,
-          h('div', { className: 'rn-scroll' }, scrollChildren))
+          h('div', { className: 'rn-scroll' }, scrollChildren),
+          addModal)
       } catch (failure) {
         return h('div', { className: 'rn-root' },
           StyleTag(),

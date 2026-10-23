@@ -15,13 +15,16 @@
  * Every listener is defensive: a remotenode bug must never break a chat turn.
  */
 
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { createDeliverableHub } from './lib/deliverable-hub.js'
 import { ProtocolError } from './lib/errors.js'
+import { connectAndPair, serveIncoming, sniffPairing, tokenFingerprint } from './lib/pairing.js'
 import { createPeerManager } from './lib/peer-manager.js'
+import { createPeersStore } from './lib/peers-store.js'
 import { registerRoutes } from './lib/routes.js'
 import { createSessionBridge } from './lib/session-bridge.js'
 import { createStore } from './lib/store.js'
@@ -78,6 +81,8 @@ export function defaultConfig() {
     requestTimeoutMs: 30_000,
     heartbeatIntervalMs: 10_000,
     heartbeatTimeoutMs: 30_000,
+    pairingToken: '',
+    pairApprovalTimeoutMs: 120_000,
   }
 }
 
@@ -146,11 +151,12 @@ export function loadConfig(rowConfig) {
   merged.autoFetchImages = merged.autoFetchImages !== false
   for (const key of [
     'maxAutoFetchBytes', 'maxDeliverableBytes', 'maxArtifactFetchBytes',
-    'requestTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs',
+    'requestTimeoutMs', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'pairApprovalTimeoutMs',
   ]) {
     const value = Number(merged[key])
     merged[key] = Number.isFinite(value) && value > 0 ? value : config[key]
   }
+  merged.pairingToken = oneLine(merged.pairingToken)
   return { config: merged, problems }
 }
 
@@ -185,6 +191,117 @@ export function createRuntime(ctx, rowConfig) {
   let peerManager = null
   let hub = null
   const store = createStore({ dataDir: config.dataDir })
+  const peersStore = createPeersStore({ store, logger, fixedToken: config.pairingToken || undefined })
+
+  /** Pending pairing approvals keyed by requestId; the pairing socket waits on `settle`. */
+  const pendingPairs = new Map()
+
+  /** Effective peers: static config.json peers first, then UI-paired peers from disk (config wins). */
+  function effectivePeers() {
+    const list = []
+    const seen = new Set()
+    for (const peer of config.peers) {
+      if (seen.has(peer.nodeId)) continue
+      seen.add(peer.nodeId)
+      list.push({ ...peer, source: 'config' })
+    }
+    for (const peer of peersStore.list()) {
+      if (seen.has(peer.nodeId)) continue
+      seen.add(peer.nodeId)
+      list.push(peer)
+    }
+    return list
+  }
+
+  /** Pairing token + fingerprint for the panel. */
+  function pairingInfo() {
+    const info = peersStore.tokenInfo()
+    return {
+      token: info.token,
+      fingerprint: tokenFingerprint(info.token),
+      createdAt: info.createdAt,
+      rotatedAt: info.rotatedAt,
+      fixedByConfig: info.fixedByConfig,
+    }
+  }
+
+  /** Pending pairing requests, safe for JSON. */
+  function pendingPairViews() {
+    return [...pendingPairs.values()].map(item => ({
+      requestId: item.requestId,
+      nodeId: item.nodeId,
+      nodeName: item.nodeName,
+      remoteAddress: item.remoteAddress,
+      remotePort: item.remotePort,
+      listenPort: item.listenPort,
+      createdAt: item.createdAt,
+    }))
+  }
+
+  /**
+   * Ask the panel to approve one incoming pairing request. Requests from the
+   * same node id share one promise; the panel answers through decidePairApproval.
+   */
+  function requestPairApproval(request) {
+    for (const item of pendingPairs.values()) {
+      if (item.nodeId !== request.nodeId) continue
+      item.remoteAddress = request.remoteAddress || item.remoteAddress
+      item.remotePort = request.remotePort || item.remotePort
+      item.listenPort = request.listenPort || item.listenPort
+      return item.promise
+    }
+    if (pendingPairs.size >= 5) return Promise.resolve({ approved: false, reason: 'busy' })
+    const requestId = randomUUID()
+    let settle
+    const promise = new Promise(resolveFn => { settle = resolveFn })
+    const timeoutMs = config.pairApprovalTimeoutMs
+    const timer = setTimeout(() => {
+      if (!pendingPairs.has(requestId)) return
+      pendingPairs.delete(requestId)
+      settle({ approved: false, reason: 'timeout' })
+    }, timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    pendingPairs.set(requestId, {
+      requestId,
+      nodeId: request.nodeId,
+      nodeName: request.nodeName,
+      remoteAddress: request.remoteAddress,
+      remotePort: request.remotePort,
+      listenPort: request.listenPort,
+      createdAt: Date.now(),
+      settle,
+      timer,
+      promise,
+    })
+    logger.info?.(`[remotenode] pairing request from ${request.nodeId} (${request.remoteAddress}) awaiting approval`)
+    return promise
+  }
+
+  function decidePairApproval(requestId, approve) {
+    const item = pendingPairs.get(requestId)
+    if (item === undefined) return { ok: false, error: 'pair/unknown-request' }
+    clearTimeout(item.timer)
+    pendingPairs.delete(requestId)
+    item.settle({ approved: approve === true, reason: approve === true ? 'approved' : 'rejected' })
+    logger.info?.(`[remotenode] pairing request ${requestId} ${approve === true ? 'approved' : 'rejected'}`)
+    return { ok: true }
+  }
+
+  /** One pairing socket that the listener sniffed out. */
+  async function handlePairingSocket(socket) {
+    await serveIncoming(socket, {
+      token: peersStore.token(),
+      self: { nodeId: self.nodeId, nodeName: self.nodeName, listenPort: config.listen.port },
+      isKnownPeer: nodeId => effectivePeers().some(peer => peer.nodeId === nodeId),
+      requestApproval: requestPairApproval,
+      onApproved: async (peer) => {
+        peersStore.add(peer)
+        await peerManager?.addPeer?.(peer)
+        logger.info?.(`[remotenode] paired with ${peer.nodeId} (${peer.host}:${peer.port}); persisted`)
+      },
+      logger,
+    })
+  }
 
   const bridge = createSessionBridge({
     self,
@@ -211,15 +328,22 @@ export function createRuntime(ctx, rowConfig) {
 
   /** Peers for the panel: manager truth, padded with configured-but-offline rows. */
   function peerViews() {
+    const effective = effectivePeers()
+    const sourceByNode = new Map(effective.map(peer => [peer.nodeId, peer.source]))
     let managerRows = []
     try { managerRows = peerManager?.state?.() ?? [] } catch (error) { logger.warn?.('[remotenode] peer state failed', error) }
-    const rows = Array.isArray(managerRows) ? managerRows.slice() : []
+    const rows = (Array.isArray(managerRows) ? managerRows : []).map(row => {
+      const source = row?.source ?? sourceByNode.get(row?.peerNodeId) ?? 'config'
+      return { ...row, source, removable: source === 'paired' }
+    })
     const seen = new Set(rows.map(row => row?.peerNodeId))
-    for (const peer of config.peers) {
+    for (const peer of effective) {
       if (seen.has(peer.nodeId)) continue
+      seen.add(peer.nodeId)
       rows.push({
         peerNodeId: peer.nodeId, nodeName: peer.nodeName, state: 'offline',
         direction: null, linkId: null, lastSeen: null, rttMs: null, remote: null, error: null,
+        source: peer.source, removable: peer.source === 'paired', configured: true, dial: peer.dial,
       })
     }
     return rows
@@ -245,6 +369,8 @@ export function createRuntime(ctx, rowConfig) {
         peers: peerViews(),
         sessions: bridge.sessionViews(),
         deliverables: deliverableViews(),
+        pairing: pairingInfo(),
+        pendingPairs: pendingPairViews(),
         warnings: problems.slice(),
       }
     },
@@ -332,6 +458,85 @@ export function createRuntime(ctx, rowConfig) {
         return { ok: false, error: errorText(error) }
       }
     },
+
+    /** Pair with a new node from the panel (client role). */
+    async pair({ host, port, token, nodeName }) {
+      try {
+        const targetHost = oneLine(host)
+        const targetPort = Number(port)
+        const pairToken = oneLine(token)
+        if (targetHost === '' || !/^[A-Za-z0-9._:[\]-]{1,255}$/.test(targetHost)) throw new Error('invalid host')
+        if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) throw new Error('invalid port')
+        if (Buffer.byteLength(pairToken, 'utf8') < 16) throw new Error('pairing token is too short')
+        if (effectivePeers().some(peer => peer.host === targetHost && peer.port === targetPort)) {
+          const existing = effectivePeers().find(peer => peer.host === targetHost && peer.port === targetPort)
+          if (existing !== undefined) throw new Error(`already paired with ${existing.nodeId}`)
+        }
+        const result = await connectAndPair({
+          host: targetHost,
+          port: targetPort,
+          token: pairToken,
+          self: { nodeId: self.nodeId, nodeName: self.nodeName, instanceEpoch: self.instanceEpoch, listenPort: config.listen.port },
+          timeoutMs: Math.max(config.requestTimeoutMs, 25_000),
+        })
+        if (result.ok !== true) return { ok: false, error: result.error }
+        const peer = { ...result.peer }
+        if (peer.nodeId === self.nodeId) return { ok: false, error: 'pair/self' }
+        if (effectivePeers().some(item => item.nodeId === peer.nodeId)) {
+          return { ok: false, error: `already paired with ${peer.nodeId}` }
+        }
+        try { peersStore.add(peer) } catch (error) { return { ok: false, error: `pair persist failed: ${errorText(error)}` } }
+        await peerManager?.addPeer?.(peer)
+        const view = peerViews().find(row => row.peerNodeId === peer.nodeId) ?? { peerNodeId: peer.nodeId, nodeName: peer.nodeName, state: 'offline', source: 'paired', removable: true }
+        logger.info?.(`[remotenode] paired to ${peer.nodeId} at ${peer.host}:${peer.port}`)
+        return { ok: true, peer: view, paired: true }
+      } catch (error) {
+        return { ok: false, error: errorText(error) }
+      }
+    },
+
+    /** Approve or reject one pending pairing request (server role). */
+    approvePair({ requestId, approve }) {
+      try {
+        if (oneLine(requestId) === '') throw new Error('requestId is required')
+        return decidePairApproval(oneLine(requestId), approve === true)
+      } catch (error) {
+        return { ok: false, error: errorText(error) }
+      }
+    },
+
+    /** Remove one UI-paired node (config peers stay). */
+    async removePeer({ peerNodeId }) {
+      try {
+        const nodeId = oneLine(peerNodeId)
+        if (nodeId === '') throw new Error('peerNodeId is required')
+        if (config.peers.some(peer => peer.nodeId === nodeId)) {
+          throw new Error('this peer comes from config.json; edit config.json to remove it')
+        }
+        const runtimePeer = peersStore.get(nodeId)
+        if (runtimePeer === null) return { ok: true, removed: false }
+        const link = peerManager?.linkFor?.(nodeId)
+        if (link !== null && link !== undefined && typeof link.isReady === 'function' && link.isReady()) {
+          try { link.notify('pair.revoke', { nodeId: self.nodeId }) } catch {}
+        }
+        peersStore.remove(nodeId)
+        await peerManager?.removePeer?.(nodeId)
+        logger.info?.(`[remotenode] removed paired node ${nodeId}`)
+        return { ok: true, removed: true }
+      } catch (error) {
+        return { ok: false, error: errorText(error) }
+      }
+    },
+
+    /** Rotate the pairing token (disabled when config.json fixes it). */
+    rotatePairingToken() {
+      try {
+        peersStore.rotateToken()
+        return { ok: true, pairing: pairingInfo() }
+      } catch (error) {
+        return { ok: false, error: errorText(error) }
+      }
+    },
   }
 
   const runtime = {
@@ -340,6 +545,7 @@ export function createRuntime(ctx, rowConfig) {
     self,
     logger,
     store,
+    peersStore,
     bridge,
     hub,
     api,
@@ -349,10 +555,12 @@ export function createRuntime(ctx, rowConfig) {
       store.ensure()
       mkdirSync(config.workspace, { recursive: true })
       mkdirSync(config.dataDir, { recursive: true })
+      peersStore.load()
       bridge.load()
-      hub.init(config.peers)
+      const peers = effectivePeers()
+      hub.init(peers)
       peerManager = createPeerManager({
-        config,
+        config: { ...config, peers },
         instanceEpoch: self.instanceEpoch,
         logger,
         handlers: {
@@ -387,16 +595,47 @@ export function createRuntime(ctx, rowConfig) {
             throw new ProtocolError('method/not-found', `unknown method ${method}`)
           },
           onNotification: (link, method, params) => {
+            if (method === 'pair.revoke') {
+              // The other side removed us; drop the paired record locally too.
+              try {
+                const nodeId = isRecord(params) ? oneLine(params.nodeId) : ''
+                if (nodeId !== '' && config.peers.every(peer => peer.nodeId !== nodeId) && peersStore.get(nodeId) !== null) {
+                  peersStore.remove(nodeId)
+                  void peerManager?.removePeer?.(nodeId)
+                  logger.info?.(`[remotenode] peer ${nodeId} revoked pairing`)
+                }
+              } catch (error) {
+                logger.warn?.('[remotenode] pair.revoke failed', error)
+              }
+              return
+            }
             try { bridge.handleNotification(link, method, params) } catch (error) { logger.warn?.('[remotenode] bridge notification failed', error) }
             try { hub.handleNotification(link, method, params) } catch (error) { logger.warn?.('[remotenode] hub notification failed', error) }
           },
           onBinary: (link, header, payload) => {
             try { hub.onBinary(link, header, payload) } catch (error) { logger.warn?.('[remotenode] hub binary failed', error) }
           },
+          onRawConnection: (socket, proceed) => {
+            // A pairing connection starts with the 'R' magic byte instead of a
+            // framed JSON-RPC length; sniff it before the normal handshake.
+            try {
+              sniffPairing(socket, {
+                onPair: pairSocket => { void handlePairingSocket(pairSocket) },
+                onNormal: () => {
+                  try { proceed() } catch (error) { logger.warn?.('[remotenode] proceed handshake failed', error) }
+                },
+              })
+              return true
+            } catch (error) {
+              logger.warn?.('[remotenode] pairing sniff failed', error)
+              return false
+            }
+          },
         },
       })
       await peerManager.start()
-      logger.info?.(`[remotenode] node ${self.nodeId} (${self.nodeName}); peers=${config.peers.length}; listen=${config.listen.enabled ? `${config.listen.host}:${config.listen.port}` : 'off'}; data=${config.dataDir}`)
+      logger.info?.(`[remotenode] node ${self.nodeId} (${self.nodeName}); peers=${peers.length} (config ${config.peers.length}, paired ${peers.length - config.peers.length}); listen=${config.listen.enabled ? `${config.listen.host}:${config.listen.port}` : 'off'}; data=${config.dataDir}`)
+      logger.info?.(`[remotenode] pairing token fingerprint ${pairingInfo().fingerprint}${config.pairingToken ? ' (fixed by config)' : ''}`)
       for (const problem of problems) logger.warn?.(`[remotenode] config: ${problem}`)
     },
     async stop() {
@@ -473,14 +712,19 @@ export function registerTools(ctx, runtime) {
       try {
         switch (action) {
           case 'list_peers': {
-            const rows = runtime.api.state().peers
+            const state = runtime.api.state()
+            const rows = state.peers
+            const pendingPairs = Array.isArray(state.pendingPairs) ? state.pendingPairs : []
             const online = rows.filter(row => row.state === 'online').length
             const lines = rows.map(row => `- ${row.peerNodeId} (${row.nodeName}): ${row.state}${row.direction ? `, ${row.direction}` : ''}${row.rttMs != null ? `, rtt ${row.rttMs}ms` : ''}`)
+            const pendingNote = pendingPairs.length === 0
+              ? ''
+              : `\n注意：有 ${pendingPairs.length} 个配对请求等待用户在「远程节点」面板审批（${pendingPairs.map(item => `${item.nodeId} @ ${item.remoteAddress}`).join('; ')}）。`
             return {
-              summary: rows.length === 0
-                ? '没有配置远程节点。请在 $DSH_HOME/remotenode/config.json 的 peers 里配置对端（见 README）。'
-                : `远程节点 ${online}/${rows.length} 在线：\n${lines.join('\n')}`,
-              detail: { peers: rows },
+              summary: (rows.length === 0
+                ? '当前没有远程节点。可在「远程节点」面板用「添加节点」（IP/端口/配对令牌）发起配对，对端审批后自动建立连接；也可以在 $DSH_HOME/remotenode/config.json 配置静态 peers。'
+                : `远程节点 ${online}/${rows.length} 在线：\n${lines.join('\n')}`) + pendingNote,
+              detail: { peers: rows, pendingPairs },
             }
           }
           case 'list_sessions': {

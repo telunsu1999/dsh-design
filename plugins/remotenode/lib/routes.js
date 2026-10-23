@@ -170,6 +170,38 @@ export function registerRoutes(ctx, runtime) {
         return
       }
 
+      if (path === `${API_PATH}/peers/pair` && method === 'POST') {
+        const body = await readJsonBody(req)
+        sendJson(res, 200, await runtime.api.pair({
+          host: text(body.host),
+          port: body.port,
+          token: text(body.token),
+          nodeName: text(body.nodeName),
+        }))
+        return
+      }
+
+      if (path === `${API_PATH}/peers/approve` && method === 'POST') {
+        const body = await readJsonBody(req)
+        sendJson(res, 200, runtime.api.approvePair({
+          requestId: text(body.requestId),
+          approve: body.approve === true,
+        }))
+        return
+      }
+
+      if (path === `${API_PATH}/peers/remove` && method === 'POST') {
+        const body = await readJsonBody(req)
+        sendJson(res, 200, await runtime.api.removePeer({ peerNodeId: text(body.peerNodeId) }))
+        return
+      }
+
+      if (path === `${API_PATH}/pairing/rotate` && method === 'POST') {
+        await readJsonBody(req).catch(() => ({}))
+        sendJson(res, 200, runtime.api.rotatePairingToken())
+        return
+      }
+
       if (path === `${API_PATH}/publish` && method === 'POST') {
         const body = await readJsonBody(req)
         sendJson(res, 200, await runtime.api.publish({

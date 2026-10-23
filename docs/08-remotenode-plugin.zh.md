@@ -119,7 +119,37 @@
 - **HMR**：bundle 以 `link:` 形式安装，Host 代码改动通过 Plugin Manager 重组合触发模块替换（本轮实际用 `set_bundle` 触发，无需重启 3080）；Client 代码改动由 client-modules HMR 加载。
 - **安全**：TCP 默认 loopback；共享密钥 HMAC；未知 nodeId 拒绝；`/api/remotenode/*` 依赖 loopback 与本机同源。
 
-## 7. 已知问题 / 下一步（建议 M2 优先级）
+## 7. 节点管理 v1.1（UI 配对 / 审批 / 删除）
+
+v0.2.0 起不再只能手写 `config.json`：
+
+| 角色 | 操作 |
+|---|---|
+| 服务端（被连接方） | 面板显示/复制本机**配对令牌**（可轮换；`config.json` 写 `pairingToken` 时固定）；收到配对请求时面板出现**审批卡片**（nodeId/名称/来源 IP/时间），批准或拒绝（120s 超时自动拒绝） |
+| 客户端（主动方） | 面板「添加节点」填 **IP/域名 + 对等端口 + 配对令牌** → 发起配对；成功后自动持久化并建链 |
+| 删除 | 节点行「删除」（仅 UI 配对节点；config 节点只读）→ 关闭链路并通知对端同步移除（`pair.revoke`） |
+
+实现要点：
+- 配对协议跑在**同一对等 TCP 端口**上、正常握手之前：首字节 `0x52` 魔数 + 一行 JSON（见 [SPEC §10.2](../plugins/remotenode/SPEC.md)），用配对令牌做 HMAC 双向证明，服务端人工审批后双方派生**每链路独立密钥** `hmac(token, 'remotenode-link:v1:'+排序nodeId)`，后续重连不再用原始令牌；
+- 持久化：`<dataDir>/peers.json`（UI 配对节点）+ `<dataDir>/pairing.json`（令牌，600）；与静态 `config.json` peers 合并（config 优先）；
+- 传输层扩展：监听端口 `onRawConnection` 首字节嗅探 hook（`0x52` 走配对，其余 unshift 回正常握手）+ `manager.addPeer/removePeer` 运行时增删（peer-transport 实现，8 项传输测试全绿）；并修复双侧同时互拨时可能停在非规范方向 fallback 的竞态（canonical 侧 250ms 后补拨规范方向，失败按退避重试、不中断现有链路）；
+- UI：顶栏「添加节点」弹窗、配对令牌显示/复制/轮换、待审批卡片（批准/拒绝）、节点来源标签与删除。
+
+![远程节点配对面板（fixture 数据）](assets/remotenode-panel-pairing.png)
+
+验收（`bash plugins/remotenode/scripts/e2e-pairing.sh`，临时第三实例 `pair-node`，node-env 实测 **22 PASS / 0 FAIL**，连跑 3 次；Lead 独立复跑同样 22/22）：
+
+1. 两侧 state 含 `pairing`/`pendingPairs`；3082 令牌 64 hex；
+2. 3080 → 3082 发起配对：3082 `pendingPairs` 出现 `brain-linux` 请求；
+3. 3082 审批通过后 pair 返回 `{ok:true, peer:{peerNodeId:'pair-node', source:'paired', removable:true}, paired:true}`；
+4. 双方 `state=online`（source=paired、rtt 5–6ms，linkId `brain-linux~pair-node`）；
+5. 3080 删除 pair-node 后 3082 收到 `pair.revoke` 自动移除；3080 peers 只剩 `desktop-node(config)`、`peers.json` 为空、pendingPairs 清空；
+6. 失败分支：假 token 配对返回 `{ok:false,error:'auth/invalid-token'}`，无待审批残留；
+7. 配对节点跨重启自动重连（runtime 冒烟另测：重启客户端后链路自动恢复）；
+8. 令牌轮换：`POST /pairing/rotate` 后指纹变化、已建立的链路不受影响（Lead 实测）；
+9. UI 侧（web-client 实测）：fake 冒烟 43/43、fixture 渲染回归 15/15、真实 React SSR 3/3、真实 Chrome fixture E2E 14/14（EN/ZH 全配对路径 + 既有功能回归）、真实 3080 Host 只读联调 7/7（令牌掩码/显示/复制/指纹、错误配对展示、peers 不变）；未在真实环境验证的仅「正确 token 的成功配对 UI 路径」与「真实 pendingPairs 审批点击」——其线协议成功路径已由 e2e-pairing 覆盖。
+
+## 8. 已知问题 / 下一步（建议 M2 优先级）
 
 1. **审批转发**（最高价值）：执行侧把 `approval/request` 经 link 转发给发起侧面板，先到先得 + fail-closed；解锁「节点以 ask 策略无人值守」。
 2. **本机普通会话 `present` 自动同步**：监听本机 link 相关会话的 `deliverables/presented`，补齐双向交付物（现在远程会话自动、本机走 publish）。

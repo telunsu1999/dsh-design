@@ -317,3 +317,77 @@ body `{ peerNodeId, path, description? }` → `{ok:true, deliverable:{…}}`（�
 - 安装：`plugin_manager install_bundle target=<绝对目录>`（Lead 执行）；
 - 双实例：`bash scripts/setup-node-profile.sh`（node-env 实现）→ `bash scripts/run-node.sh` → 面板/HTTP 验证；
 - 端到端脚本：Lead 写 `scripts/e2e.sh`（curl 驱动 HTTP API 演示双向会话 + 交付物）。
+
+## 10. 节点管理：UI 配对 / 审批 / 删除（v1.1 追加，2026-10-23）
+
+目标：不再只靠手写 `config.json`。用户在面板里输入 **对端 IP/域名 + 端口 + 配对令牌**，发起连接；对端面板出现**配对审批请求**，点「批准」后自动建立并持久化双向链路；面板可**删除**已配对节点。
+
+### 10.1 数据与持久化
+
+- `<dataDir>/peers.json`：UI 配对的节点（运行时持久化）
+  ```jsonc
+  { "version": 1, "peers": [
+    { "nodeId": "desktop-node", "nodeName": "台式机 worker", "host": "10.0.0.5", "port": 47301,
+      "secret": "<64hex>", "dial": "auto", "source": "paired", "addedAt": 0 }
+  ] }
+  ```
+- `<dataDir>/pairing.json`：配对令牌（自动生成，600 权限）
+  ```jsonc
+  { "version": 1, "token": "<64hex 32B>", "createdAt": 0, "rotatedAt": 0 }
+  ```
+- 静态 `config.json` 的 `peers` 仍是权威「配置节点」（`source: config`，面板只读不可删）；`config.json` 可选 `pairingToken` 固定令牌（此时禁止轮换）。
+- 有效 peers = config.peers + peers.json（nodeId 冲突时 config 优先）。
+
+### 10.2 配对线协议（同一 TCP 对等端口，握手前）
+
+客户端先发 1 字节魔数 `0x52`（'R'），随后一行 UTF-8 JSON（≤64 KiB，以 `\n` 结尾）；服务端回一行 JSON 后关闭连接。
+
+```jsonc
+// 请求
+{ "v": 1, "type": "pair.request", "nodeId": "brain-linux", "nodeName": "Linux 大脑",
+  "instanceEpoch": "…", "listenPort": 47201, "nonce": "<64hex>",
+  "proof": "<hmac-sha256(token, 'remotenode-pair-request:v1:'+nodeId+':'+nonce)>" }
+
+// 成功响应
+{ "v": 1, "type": "pair.response", "ok": true, "nodeId": "desktop-node", "nodeName": "台式机 worker",
+  "listenPort": 47301, "nonce": "<64hex>",
+  "proof": "<hmac(token, 'remotenode-pair-response:v1:'+serverNodeId+':'+clientNodeId+':'+reqNonce+':'+serverNonce)>" }
+
+// 失败响应
+{ "v": 1, "type": "pair.response", "ok": false, "error": "auth/invalid-token" }
+```
+
+- 错误码（字符串）：`auth/invalid-token`、`auth/invalid-proof`(客户端校验响应失败)、`pair/self`、`pair/already-paired`、`pair/busy`(待审批过多)、`pair/unknown-request`、`pair/rejected`、`pair/timeout`、`pair/invalid`。
+- 成功后双方派生链路密钥：`secret = hmacHex(token, 'remotenode-link:v1:' + [nodeIdA, nodeIdB].sort().join('~'))`，并各自持久化 peer（客户端 `host/port` 为输入值，服务端 `host` 为 socket 远端地址、`port` 为客户端 `listenPort`，0 则 `dial:'off'`）。
+- 客户端随后用派生的 `secret` 走正常 `peer.hello/welcome` 握手；服务端已保存该 peer，故能正常互认。
+- 配对连接流程（服务端）：读请求(10s 超时) → 校验魔数/JSON/proof（constant-time）→ 自身 nodeId 拒绝 → 已在有效 peers 中则直接成功(幂等) → 建待审批（相同 nodeId 去重）→ 等待面板决定（120s）→ 成功/拒绝/超时后响应并关闭 socket。
+- 服务端在 `socket.remoteAddress` 记录来源 IP（用于审批展示与审计）。
+
+### 10.3 HTTP API 追加（`/api/remotenode`）
+
+- `state` 追加：
+  - `pairing: { token, fingerprint, createdAt, fixedByConfig }`
+  - `pendingPairs: [{ requestId, nodeId, nodeName, remoteAddress, remotePort, listenPort, createdAt }]`
+  - `peers[]` 追加 `source: "config"|"paired"`、`removable: boolean`
+- `POST /peers/pair`：body `{ host, port, token, nodeName? }` → `{ ok:true, peer:{…}, paired:true }` / `{ ok:false, error }`。客户端角色执行 10.2 全流程，成功后 `manager.addPeer` 并持久化。
+- `POST /peers/approve`：body `{ requestId, approve:boolean }` → `{ ok:true }` / `{ ok:false, error }`。服务端角色使用。
+- `POST /peers/remove`：body `{ peerNodeId }` → `{ ok:true }`（仅删除 `source:'paired'`；config 节点返回错误）。关闭链路、停止拨号、删除持久化；若链路在线且对端支持，先发 `pair.revoke` 通知（见 10.4）。
+- `POST /pairing/rotate`：重新生成令牌 → `{ ok:true, pairing:{…} }`；`fixedByConfig` 时返回错误。
+- 通知：`pair.revoke`（notification，`{ nodeId }`）——对端收到后把该 peer 标记 `revoked` 并从其持久化中移除（若对端也是 paired）。
+
+### 10.4 对等传输层需要的扩展（peer-transport 负责）
+
+1. `createPeerManager({...})` 增加 `options.handlers.onRawConnection?: (socket, proceed: () => void) => boolean`：
+   - 在监听端口收到新 TCP 连接、创建 PeerLink **之前**调用；
+   - 返回 `true` 表示调用方将接管该 socket（同步消费或异步处理；**必须**自行关闭）；返回 `false` 表示立即走正常 PeerLink 监听握手；
+   - 若 hook 需要先读字节判断，可返回 `true` 并在判定「不是配对连接」后调用 `proceed()` 让 manager 继续正常握手（socket 已读取的字节需 `unshift` 回去）；异常按 `false` 处理。
+2. `manager.addPeer(peerConfig)` / `manager.removePeer(nodeId)`：运行时增删 peer 配置（去重更新、启动/停止拨号循环、关闭已有链路、重算 state）；幂等，不重启 manager。
+3. `manager.state()` 行追加 `source`（若 peerConfig 带则透传，缺省 `'config'`）与 `removable`（`source === 'paired'`）。
+4. 现有 6 项传输测试保持全绿，新增：hook 接管/放行、addPeer 后自动拨号建立、removePeer 后链路关闭且不再重拨、state 字段。
+
+### 10.5 Web UI 追加（web-client 负责）
+
+- 顶栏：新增「添加节点」按钮 + 「配对令牌」显示（默认掩码，点眼睛显示/复制；「轮换」按钮，`fixedByConfig` 时禁用）。
+- 「配对请求」卡片（有待审批时显示）：nodeId / 名称 / 来源 IP / 时间 + 「批准」「拒绝」。
+- 节点行：显示 `source` 标签（配置/已配对）；`removable` 节点有「删除」按钮（二次确认，`confirm()` 或内联确认）。
+- 新增请求/批准/删除/轮换全部 `fetch`，失败显示错误条；保持 2s 轮询与防御式渲染；zh/en 字典补齐新文案。
