@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Remote Node",
-    "description": "Peer remote nodes: add a node from the panel with its address and pairing token, approve pairing requests, create and drive remote sessions on the peer, and sync deliverables both ways (metadata, on-demand fetch, download and image preview)."
+    "description": "Peer remote nodes: edit the listen address/port in the panel, add a node with its address and pairing token, approve pairing requests, create and drive remote sessions on the peer, and sync deliverables both ways (metadata, on-demand fetch, download and image preview)."
   }
 }

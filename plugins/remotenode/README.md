@@ -119,6 +119,16 @@ bash scripts/e2e.sh all        # 全流程：A→B 会话+交付物、B→A 会�
 
 > 安全语义：令牌即共享密钥；配对连接用 HMAC 证明双方持有令牌，**人工审批**决定是否信任该节点；批准后为这一对节点派生独立链路密钥（`hmac(token, 'remotenode-link:v1:'+排序后nodeId)`），后续重连不再使用原始令牌。建议只在内网/Tailscale 暴露对等端口，并定期轮换令牌。
 
+### 监听地址/端口（应对防火墙，v0.3.0）
+
+对等监听端口不写死：面板「监听」卡片可以直接改**绑定地址 + 端口**，保存后立即生效（重建监听 socket，不用重启 DSH）：
+
+- 显示当前生效的 `enabled / host / port` 和来源（配置文件 / 面板设置 / 默认）；
+- 「修改」弹窗：启用开关、绑定地址、端口；`0.0.0.0` 或网卡 IP 才能被外部连接（需要防火墙放行该端口），`127.0.0.1` 仅本机；
+- 面板保存的值会持久化到 `$DSH_HOME/remotenode/data/settings.json`（优先级高于 `config.json`）；「恢复配置文件设置」可删除覆盖、回到 `config.json`；
+- 端口占用/权限不足会返回错误且**原监听保持不变**；改端口后会对已配对节点发送 `peer.listen` 通知，对端自动更新拨号端口；`config.json` 静态配置的对端需要你手动把其 peers 端口改成新值（日志会提示）。
+- 防火墙例子：只放行 `48401` 时，把监听改成 `0.0.0.0:48401`，客户端配对时填 `你的公网IP:48401`。
+
 ### Web 面板
 
 侧栏「远程节点」→ 主面板：
@@ -209,6 +219,8 @@ plugins/remotenode/
 cd /root/AiWork/DSH_Design/plugins/remotenode
 /root/.nvm/versions/node/v22.22.1/bin/node --test tests/     # 86 项：ids/errors/frames/handshake/dedupe/deliverable/sync/store/peer
 bash scripts/e2e.sh all                                      # 双实例端到端
+bash scripts/e2e-pairing.sh                                  # UI 配对流程（临时第三实例，22 项）
+bash scripts/e2e-listen.sh                                   # 监听端口变更流程（临时第三实例，39 项）
 ```
 
 ## 卸载

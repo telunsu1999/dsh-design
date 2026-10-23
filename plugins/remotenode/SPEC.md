@@ -391,3 +391,46 @@ body `{ peerNodeId, path, description? }` → `{ok:true, deliverable:{…}}`（�
 - 「配对请求」卡片（有待审批时显示）：nodeId / 名称 / 来源 IP / 时间 + 「批准」「拒绝」。
 - 节点行：显示 `source` 标签（配置/已配对）；`removable` 节点有「删除」按钮（二次确认，`confirm()` 或内联确认）。
 - 新增请求/批准/删除/轮换全部 `fetch`，失败显示错误条；保持 2s 轮询与防御式渲染；zh/en 字典补齐新文案。
+
+## 11. 监听地址/端口可配置（v1.2 追加，2026-10-23）
+
+问题：对等监听端口不能写死——服务器防火墙只放开特定端口时，需要能改成那个端口，且最好在 UI 里改、即时生效。
+
+### 11.1 运行时覆盖与持久化
+
+- `<dataDir>/settings.json`（新增）：
+  ```jsonc
+  { "version": 1, "listen": { "enabled": true, "host": "0.0.0.0", "port": 48401 }, "updatedAt": 0 }
+  ```
+- 有效监听 = `settings.json.listen`（若有）→ `config.json.listen` → 默认（disabled/127.0.0.1/47201）。
+- 保存成功后立即应用（重建监听 socket），无需重启 DSH；`state.self.listen` 返回有效值，并新增：
+  - `state.self.listenSource: "settings" | "config" | "default"`
+  - `state.self.listenOverride: boolean`
+- 配对协议里的 `listenPort`（请求/响应/对端记录）和日志都用**有效端口**。
+
+### 11.2 HTTP API
+
+- `POST /api/remotenode/listen`：body `{ enabled?: boolean, host?: string, port?: number, reset?: boolean }`
+  - 校验：host 非空（IP 或主机名）；port 1–65535；`enabled:false` 允许 host/port 省略（保留上次值）。
+  - 调 `manager.setListen({enabled, host, port})`（见 11.3）；成功才写 `settings.json`；失败返回 `{ok:false, error}`（如 `EADDRINUSE` / `EACCES`），原监听保持不变。
+  - `reset:true`：删除运行时覆盖，回到 config.json 的监听配置并应用。
+  - 成功后向所有在线链路发送通知 `peer.listen`：`{ nodeId: <本机>, listenPort: <有效端口>, host?: <有效host> }`。
+- 收到 `peer.listen` 通知：更新**已配对（source=paired）**peer 的 `port`（必要时 `host`），持久化并 `manager.addPeer` 更新拨号目标；`config` 来源的 peer 只记 warn（提示用户改 config.json）。
+
+### 11.3 传输层需要新增（peer-transport）
+
+`manager.setListen({ enabled: boolean, host: string, port: number })` → `{ ok: true, listen } | { ok: false, error }`（异步）：
+- 关闭旧监听 socket（不再 accept，已建立连接不受影响）；
+- enabled=false：只关闭；enabled=true：按新 host/port `listen`，失败时**尝试恢复旧监听**再返回错误；
+- 幂等（配置未变直接成功）；不重启拨号循环/不影响现有链路；
+- 更新 `manager.state()` 无关；监听信息以 `manager.listenInfo()`（可选）或 config 传入为准。
+- 测试：改端口后新端口可被新 peer 连接、旧端口不再监听；绑不上（如已占用）返回 error 且旧监听仍工作；enabled=false 关闭监听。
+
+### 11.4 UI（web-client）
+
+- 「监听」卡片（放在「配对令牌」旁边/上方）：
+  - 展示当前 `enabled / host / port` 与来源（配置文件 / 面板设置）；
+  - 「修改」按钮 → 弹窗：开关、绑定地址（提示 127.0.0.1 仅本机；0.0.0.0/具体网卡 IP 才可被外部连接）、端口；保存中禁用；成功后提示并刷新；失败展示后端 error（端口占用/权限）；
+  - 「恢复配置文件设置」按钮（`reset:true`），仅当存在面板覆盖时可用；
+  - host 非 loopback 时在弹窗内显示安全提示（防火墙/暴露面）。
+- 所有状态字段缺失时防御式隐藏，不白屏；zh/en 文案补齐。

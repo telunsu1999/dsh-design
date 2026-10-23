@@ -137,6 +137,8 @@ class PeerManager {
   #pingTimers = new Map()
   /** @type {Set<any>} 已经向上层转发过 onLinkUp 的 link 对象（保证 up/down 成对） */
   #announcedLinks = new Set()
+  /** @type {Promise<void>} setListen 串行队列（并发调用按调用顺序生效） */
+  #listenQueue = Promise.resolve()
 
   /**
    * @param {object} options
@@ -355,6 +357,187 @@ class PeerManager {
     }
     this.#stopping = false
     this.#logger.info(`[peer-manager] ${this.#self.nodeId} stopped`)
+  }
+
+  // =====================================================================
+  // 监听重绑定（SPEC §11.3：对等监听端口可在 UI 即时修改）
+  // =====================================================================
+
+  /**
+   * 当前监听信息（只读）。
+   *
+   * `enabled` 表示**此刻真的在监听**（不仅是配置值）；未监听时仍返回最后一次
+   * 配置的 host/port 供 UI 展示与回填（此时用 listenInfo().enabled===false）。
+   * @returns {{enabled:boolean, host:string, port:number} | null}
+   */
+  listenInfo() {
+    if (this.#listen === undefined || this.#listen === null) return null
+    const bound = this.#server !== null
+    const address = bound ? this.#server.address?.() : null
+    return {
+      enabled: bound && this.#listen.enabled === true,
+      host: this.#listen.host,
+      port: bound && address !== null && typeof address === 'object' ? address.port : this.#listen.port,
+    }
+  }
+
+  /**
+   * 运行时修改监听（SPEC §11.3）。
+   *
+   * - 关闭旧监听 socket（不再 accept；**已建立链路和拨号循环完全不受影响**）；
+   * - `enabled:false`：只关闭，端口释放；
+   * - `enabled:true`：用新 host/port 重新 listen，成功后返回新监听信息；
+   * - 新监听失败（EADDRINUSE / EACCES / 非法地址）：尝试恢复旧监听后再返回
+   *   `{ok:false, error}`，恢复成功后旧监听仍可用于新连接；
+   * - 配置未变的幂等调用直接返回成功；并发调用按调用顺序串行执行。
+   *
+   * @param {{enabled?:boolean, host?:string, port?:number}} input
+   * @returns {Promise<{ok:true, listen:{enabled:boolean, host:string, port:number}}|{ok:false, error:string}>}
+   */
+  setListen(input) {
+    const run = () => this.#applySetListen(input)
+    const task = this.#listenQueue.then(run, run)
+    // 队列只保证顺序，不把单次失败传给后续调用。
+    this.#listenQueue = task.then(() => undefined, () => undefined)
+    return task
+  }
+
+  /**
+   * 校验 setListen 入参（缺省字段沿用当前配置；enabled=false 时允许省略 host/port）。
+   * @param {unknown} input
+   * @returns {{listen:{enabled:boolean,host:string,port:number}}|{error:string}}
+   */
+  #normalizeListen(input) {
+    if (!isRecord(input)) return { error: 'listen config must be an object' }
+    const current = this.#listen
+    let enabled = current.enabled === true
+    if (input.enabled !== undefined) {
+      if (typeof input.enabled !== 'boolean') return { error: 'enabled must be a boolean' }
+      enabled = input.enabled
+    }
+    let host = current.host
+    if (input.host !== undefined) {
+      host = text(input.host, '')
+      if (host === '') return { error: 'host must be a non-empty string' }
+    }
+    let port = current.port
+    if (input.port !== undefined) {
+      const parsed = Number(input.port)
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        return { error: 'port must be an integer between 1 and 65535' }
+      }
+      port = parsed
+    }
+    if (enabled && (host === '' || !Number.isInteger(port))) {
+      return { error: 'enabled listen requires host and port' }
+    }
+    return { listen: { enabled, host, port } }
+  }
+
+  /** @param {any} input */
+  async #applySetListen(input) {
+    const normalized = this.#normalizeListen(input)
+    if (normalized.error !== undefined) return { ok: false, error: normalized.error }
+    const next = normalized.listen
+    const previous = { ...this.#listen }
+    const unchanged = next.enabled === previous.enabled
+      && next.host === previous.host
+      && next.port === previous.port
+    const consistent = next.enabled ? this.#server !== null : this.#server === null
+    if (unchanged && consistent) {
+      return { ok: true, listen: this.#listenView(next) }
+    }
+    if (!this.#started) {
+      // 尚未 start：只更新配置，start() 时生效。
+      this.#listen = next
+      return { ok: true, listen: this.#listenView(next) }
+    }
+
+    this.#logger.info(
+      `[peer-manager] setListen: ${previous.host}:${previous.port}(enabled=${previous.enabled}) -> ${next.host}:${next.port}(enabled=${next.enabled})`,
+    )
+    await this.#closeListenerSocket()
+
+    if (!next.enabled) {
+      this.#listen = next
+      this.#listenError = null
+      this.#logger.info('[peer-manager] peer listener disabled at runtime (existing links untouched)')
+      return { ok: true, listen: this.#listenView(next) }
+    }
+
+    try {
+      await this.#bindWithRetry(next)
+      this.#listen = next
+      this.#listenError = null
+      this.#logger.info(`[peer-manager] peer listener rebound to ${next.host}:${this.listenPort}`)
+      return { ok: true, listen: this.#listenView(next) }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.#listenError = message
+      this.#logger.warn(
+        `[peer-manager] setListen ${next.host}:${next.port} failed: ${message}; restoring ${previous.host}:${previous.port}`,
+      )
+      // 回滚：恢复旧监听（旧配置 enabled 时），旧监听必须仍能接受新连接。
+      this.#listen = previous
+      if (previous.enabled) {
+        try {
+          await this.#bindWithRetry({ ...previous })
+          this.#logger.info(`[peer-manager] peer listener restored on ${previous.host}:${this.listenPort}`)
+        } catch (restoreError) {
+          this.#logger.warn(
+            `[peer-manager] restore listen ${previous.host}:${previous.port} failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+          )
+        }
+      }
+      return { ok: false, error: message }
+    }
+  }
+
+  /**
+   * 关闭当前监听 socket（只停 accept，不等待已建立连接结束）。
+   * server.close() 的 callback 要等所有连接关闭，不能用；这里等一个事件循环
+   * 让监听 handle 真正释放（同端口/同 host 立即重绑时需要）。
+   */
+  async #closeListenerSocket() {
+    const server = this.#server
+    this.#server = null
+    if (server === null) return
+    try {
+      server.close()
+    } catch {
+      /* ignore */
+    }
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  /**
+   * 绑定监听；EADDRINUSE 时短暂重试（关闭旧 socket 到 OS 释放端口有极短窗口）。
+   * @param {{enabled:boolean, host:string, port:number}} listen
+   */
+  async #bindWithRetry(listen) {
+    const maxAttempts = 8
+    let lastError = null
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        return await this.#bindServer(listen)
+      } catch (error) {
+        lastError = error
+        if (error?.code !== 'EADDRINUSE' || attempt === maxAttempts - 1) throw error
+        await new Promise(resolve => setTimeout(resolve, 10 + attempt * 15))
+      }
+    }
+    throw lastError
+  }
+
+  /** @param {{enabled:boolean, host:string, port:number}} listen */
+  #listenView(listen) {
+    const bound = this.#server !== null
+    const address = bound ? this.#server.address?.() : null
+    return {
+      enabled: bound && listen.enabled === true,
+      host: listen.host,
+      port: bound && address !== null && typeof address === 'object' ? address.port : listen.port,
+    }
   }
 
   // =====================================================================
@@ -633,12 +816,26 @@ class PeerManager {
   // =====================================================================
 
   async #startServer() {
+    await this.#bindServer(this.#listen)
+  }
+
+  /**
+   * 在指定 listen 配置上创建监听 server。成功后写入 #server 并回填 port=0 的
+   * 实际端口；失败时清理并抛出原始错误（EADDRINUSE / EACCES / ENOTFOUND 等）。
+   * @param {{enabled:boolean, host:string, port:number}} listen
+   */
+  async #bindServer(listen) {
     const server = createServer(socket => this.#onInbound(socket))
     this.#server = server
     await new Promise((resolve, reject) => {
       const onError = error => {
         cleanup()
         this.#server = null
+        try {
+          server.close()
+        } catch {
+          /* ignore */
+        }
         reject(error)
       }
       const onListening = () => {
@@ -652,13 +849,15 @@ class PeerManager {
       server.once('error', onError)
       server.once('listening', onListening)
       try {
-        server.listen(this.#listen.port, this.#listen.host)
+        server.listen(listen.port, listen.host)
       } catch (error) {
         cleanup()
         this.#server = null
         reject(error)
       }
     })
+    const address = server.address()
+    if (listen.port === 0 && address !== null && typeof address === 'object') listen.port = address.port
     server.on('error', error => {
       this.#logger.warn(`[peer-manager] listener error: ${error instanceof Error ? error.message : String(error)}`)
     })
@@ -1243,6 +1442,7 @@ function normalizeRemote(remote, peerNodeId, fallbackName) {
  * @param {object} [options.handlers] 见类 JSDoc；含 onRawConnection(socket, proceed)
  * @param {import('./handshake.js').NonceCache} [options.nonceCache]
  * @returns {PeerManager} 额外提供运行时 addPeer(peerConfig) / removePeer(nodeId)
+ *   / setListen({enabled,host,port}) / listenInfo()
  */
 export function createPeerManager(options) {
   return new PeerManager(options)

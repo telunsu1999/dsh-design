@@ -26,6 +26,7 @@ import { connectAndPair, serveIncoming, sniffPairing, tokenFingerprint } from '.
 import { createPeerManager } from './lib/peer-manager.js'
 import { createPeersStore } from './lib/peers-store.js'
 import { registerRoutes } from './lib/routes.js'
+import { createSettingsStore } from './lib/settings-store.js'
 import { createSessionBridge } from './lib/session-bridge.js'
 import { createStore } from './lib/store.js'
 
@@ -146,6 +147,7 @@ export function loadConfig(rowConfig) {
     })
   }
   merged.peers = peers
+  merged.listenSource = isRecord(fileConfig.listen) || isRecord(overrides.listen) ? 'config' : 'default'
   merged.workspace = oneLine(merged.workspace) || join(dshHome(), 'remotenode', 'workspace')
   merged.dataDir = oneLine(merged.dataDir) || join(dshHome(), 'remotenode', 'data')
   merged.autoFetchImages = merged.autoFetchImages !== false
@@ -180,6 +182,13 @@ function loggerOf(ctx) {
  */
 export function createRuntime(ctx, rowConfig) {
   const { config, problems } = loadConfig(rowConfig)
+  /** The deployment-owned listener from config.json (panel/reset target). */
+  const baseListen = {
+    enabled: config.listen.enabled,
+    host: config.listen.host,
+    port: config.listen.port,
+    source: config.listenSource ?? 'default',
+  }
   const logger = loggerOf(ctx)
   const self = {
     nodeId: config.nodeId,
@@ -192,6 +201,14 @@ export function createRuntime(ctx, rowConfig) {
   let hub = null
   const store = createStore({ dataDir: config.dataDir })
   const peersStore = createPeersStore({ store, logger, fixedToken: config.pairingToken || undefined })
+  const settingsStore = createSettingsStore({ store, logger })
+
+  /** Effective listener: runtime settings override -> config.json -> defaults (SPEC §11.1). */
+  function effectiveListen() {
+    const override = settingsStore.listen()
+    if (override !== null) return { ...override, source: 'settings' }
+    return { enabled: baseListen.enabled, host: baseListen.host, port: baseListen.port, source: baseListen.source }
+  }
 
   /** Pending pairing approvals keyed by requestId; the pairing socket waits on `settle`. */
   const pendingPairs = new Map()
@@ -291,7 +308,7 @@ export function createRuntime(ctx, rowConfig) {
   async function handlePairingSocket(socket) {
     await serveIncoming(socket, {
       token: peersStore.token(),
-      self: { nodeId: self.nodeId, nodeName: self.nodeName, listenPort: config.listen.port },
+      self: { nodeId: self.nodeId, nodeName: self.nodeName, listenPort: effectiveListen().port },
       isKnownPeer: nodeId => effectivePeers().some(peer => peer.nodeId === nodeId),
       requestApproval: requestPairApproval,
       onApproved: async (peer) => {
@@ -353,6 +370,29 @@ export function createRuntime(ctx, rowConfig) {
     try { return hub.list() } catch (error) { logger.warn?.('[remotenode] list deliverables failed', error); return [] }
   }
 
+  /** Tell connected peers that this node's listener moved (SPEC §11.2). */
+  async function notifyListenChange(listen) {
+    try {
+      const rows = peerManager?.state?.() ?? []
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (row?.state !== 'online') continue
+        const link = peerManager?.linkFor?.(row.peerNodeId)
+        if (link === null || link === undefined || (typeof link.isReady === 'function' && !link.isReady())) continue
+        try {
+          link.notify('peer.listen', {
+            nodeId: self.nodeId,
+            listenPort: listen.enabled ? listen.port : 0,
+            ...(listen.enabled && listen.host !== '0.0.0.0' && listen.host !== '::' ? { host: listen.host } : {}),
+          })
+        } catch (error) {
+          logger.warn?.(`[remotenode] notify peer.listen to ${row.peerNodeId} failed`, error)
+        }
+      }
+    } catch (error) {
+      logger.warn?.('[remotenode] notifyListenChange failed', error)
+    }
+  }
+
   /** The single operation surface shared by the HTTP routes and the model tool. */
   const api = {
     state() {
@@ -364,7 +404,9 @@ export function createRuntime(ctx, rowConfig) {
           instanceEpoch: self.instanceEpoch,
           protocol: self.protocol,
           dataDir: config.dataDir,
-          listen: config.listen,
+          listen: (() => { const listen = effectiveListen(); return { enabled: listen.enabled, host: listen.host, port: listen.port } })(),
+          listenSource: effectiveListen().source,
+          listenOverride: settingsStore.listen() !== null,
         },
         peers: peerViews(),
         sessions: bridge.sessionViews(),
@@ -476,7 +518,7 @@ export function createRuntime(ctx, rowConfig) {
           host: targetHost,
           port: targetPort,
           token: pairToken,
-          self: { nodeId: self.nodeId, nodeName: self.nodeName, instanceEpoch: self.instanceEpoch, listenPort: config.listen.port },
+          self: { nodeId: self.nodeId, nodeName: self.nodeName, instanceEpoch: self.instanceEpoch, listenPort: effectiveListen().port },
           timeoutMs: Math.max(config.requestTimeoutMs, 25_000),
         })
         if (result.ok !== true) return { ok: false, error: result.error }
@@ -490,6 +532,39 @@ export function createRuntime(ctx, rowConfig) {
         const view = peerViews().find(row => row.peerNodeId === peer.nodeId) ?? { peerNodeId: peer.nodeId, nodeName: peer.nodeName, state: 'offline', source: 'paired', removable: true }
         logger.info?.(`[remotenode] paired to ${peer.nodeId} at ${peer.host}:${peer.port}`)
         return { ok: true, peer: view, paired: true }
+      } catch (error) {
+        return { ok: false, error: errorText(error) }
+      }
+    },
+
+    /** Change the peer listener (SPEC §11.2). */
+    async setListen({ enabled, host, port, reset }) {
+      try {
+        if (typeof peerManager?.setListen !== 'function') throw new Error('listener rebind is unavailable')
+        const current = effectiveListen()
+        if (reset === true) {
+          const target = { enabled: baseListen.enabled, host: baseListen.host, port: baseListen.port }
+          const applied = await peerManager.setListen(target)
+          if (isRecord(applied) && applied.ok === false) return { ok: false, error: errorText(applied.error) }
+          settingsStore.resetListen()
+          await notifyListenChange(effectiveListen())
+          return { ok: true, listen: { enabled: target.enabled, host: target.host, port: target.port }, source: baseListen.source, reset: true }
+        }
+        const nextEnabled = enabled === undefined ? current.enabled : enabled === true
+        const nextHost = oneLine(host) || current.host
+        if (!/^[A-Za-z0-9._:[\]-]{1,255}$/.test(nextHost)) return { ok: false, error: 'invalid listen host' }
+        const rawPort = port === undefined ? current.port : Number(port)
+        if (!Number.isInteger(rawPort) || rawPort < 1 || rawPort > 65535) return { ok: false, error: 'invalid listen port (1-65535)' }
+        const applied = await peerManager.setListen({ enabled: nextEnabled, host: nextHost, port: rawPort })
+        if (!isRecord(applied) || applied.ok !== true) {
+          return { ok: false, error: errorText(applied?.error ?? 'listener rebind failed') }
+        }
+        settingsStore.saveListen({ enabled: nextEnabled, host: nextHost, port: rawPort })
+        const listen = { enabled: nextEnabled, host: nextHost, port: rawPort }
+        config.listen = { ...listen }
+        await notifyListenChange(listen)
+        logger.info?.(`[remotenode] listener updated: ${listen.enabled ? `${listen.host}:${listen.port}` : 'disabled'}`)
+        return { ok: true, listen, source: 'settings' }
       } catch (error) {
         return { ok: false, error: errorText(error) }
       }
@@ -546,6 +621,7 @@ export function createRuntime(ctx, rowConfig) {
     logger,
     store,
     peersStore,
+    settingsStore,
     bridge,
     hub,
     api,
@@ -556,11 +632,14 @@ export function createRuntime(ctx, rowConfig) {
       mkdirSync(config.workspace, { recursive: true })
       mkdirSync(config.dataDir, { recursive: true })
       peersStore.load()
+      settingsStore.load()
       bridge.load()
       const peers = effectivePeers()
       hub.init(peers)
+      const listen = effectiveListen()
+      config.listen = { enabled: listen.enabled, host: listen.host, port: listen.port }
       peerManager = createPeerManager({
-        config: { ...config, peers },
+        config: { ...config, peers, listen: { enabled: listen.enabled, host: listen.host, port: listen.port } },
         instanceEpoch: self.instanceEpoch,
         logger,
         handlers: {
@@ -595,6 +674,27 @@ export function createRuntime(ctx, rowConfig) {
             throw new ProtocolError('method/not-found', `unknown method ${method}`)
           },
           onNotification: (link, method, params) => {
+            if (method === 'peer.listen') {
+              // The peer moved its listener: update paired endpoints so future
+              // reconnects dial the new port (SPEC §11.2).
+              try {
+                const nodeId = isRecord(params) ? oneLine(params.nodeId) : ''
+                const listenPort = isRecord(params) ? Number(params.listenPort) : 0
+                if (nodeId !== '' && config.peers.some(peer => peer.nodeId === nodeId)) {
+                  logger.warn?.(`[remotenode] peer ${nodeId} changed listen port to ${listenPort}; update config.json peers to match`)
+                } else if (nodeId !== '') {
+                  const runtimePeer = peersStore.get(nodeId)
+                  if (runtimePeer !== null && Number.isInteger(listenPort) && listenPort >= 0) {
+                    const nextPort = listenPort > 0 ? listenPort : runtimePeer.port
+                    const updated = peersStore.add({ ...runtimePeer, port: nextPort, ...(listenPort > 0 ? { dial: 'auto' } : { dial: 'off' }) })
+                    void peerManager?.addPeer?.(updated)
+                  }
+                }
+              } catch (error) {
+                logger.warn?.('[remotenode] peer.listen handling failed', error)
+              }
+              return
+            }
             if (method === 'pair.revoke') {
               // The other side removed us; drop the paired record locally too.
               try {
@@ -634,7 +734,7 @@ export function createRuntime(ctx, rowConfig) {
         },
       })
       await peerManager.start()
-      logger.info?.(`[remotenode] node ${self.nodeId} (${self.nodeName}); peers=${peers.length} (config ${config.peers.length}, paired ${peers.length - config.peers.length}); listen=${config.listen.enabled ? `${config.listen.host}:${config.listen.port}` : 'off'}; data=${config.dataDir}`)
+      logger.info?.(`[remotenode] node ${self.nodeId} (${self.nodeName}); peers=${peers.length} (config ${config.peers.length}, paired ${peers.length - config.peers.length}); listen=${listen.enabled ? `${listen.host}:${listen.port} (${listen.source})` : 'off'}; data=${config.dataDir}`)
       logger.info?.(`[remotenode] pairing token fingerprint ${pairingInfo().fingerprint}${config.pairingToken ? ' (fixed by config)' : ''}`)
       for (const problem of problems) logger.warn?.(`[remotenode] config: ${problem}`)
     },

@@ -149,7 +149,40 @@ v0.2.0 起不再只能手写 `config.json`：
 8. 令牌轮换：`POST /pairing/rotate` 后指纹变化、已建立的链路不受影响（Lead 实测）；
 9. UI 侧（web-client 实测）：fake 冒烟 43/43、fixture 渲染回归 15/15、真实 React SSR 3/3、真实 Chrome fixture E2E 14/14（EN/ZH 全配对路径 + 既有功能回归）、真实 3080 Host 只读联调 7/7（令牌掩码/显示/复制/指纹、错误配对展示、peers 不变）；未在真实环境验证的仅「正确 token 的成功配对 UI 路径」与「真实 pendingPairs 审批点击」——其线协议成功路径已由 e2e-pairing 覆盖。
 
-## 8. 已知问题 / 下一步（建议 M2 优先级）
+## 8. 监听地址/端口可配置（v1.2）
+
+服务器防火墙只放行特定端口时，对等监听端口需要能改。v0.3.0 起：
+
+| 能力 | 说明 |
+|---|---|
+| 面板修改 | 「监听」卡片显示生效的 `enabled/host/port` 与来源（配置文件/面板设置/默认）；「修改」弹窗改绑定地址+端口，保存即生效（重建监听 socket，不重启 DSH）；`0.0.0.0`/网卡 IP 才对外可连（需防火墙放行） |
+| 持久化 | 面板保存写入 `$DSH_HOME/remotenode/data/settings.json`，优先级高于 `config.json`；「恢复配置文件设置」（`reset:true`）删除覆盖 |
+| 失败保护 | 端口被占用/无权限 → 返回错误（`EADDRINUSE` 等），**原监听自动保留**且继续接受连接 |
+| 对端通知 | 改端口成功后向在线 peer 发 `peer.listen` 通知；**UI 配对**的节点自动更新拨号端口并重连，`config.json` 静态节点只记 warn（需手动改配置） |
+| 配对端口来源 | 配对请求/响应里的 `listenPort`、对端记录的端口都取**生效端口** |
+
+API：`POST /api/remotenode/listen {enabled?, host?, port?, reset?}`；state 增加 `self.listenSource`、`self.listenOverride`。传输层：`manager.setListen()` / `listenInfo()`（关闭旧 accept handle 不影响已建立链路；失败自动回滚）。
+
+验收（Lead 双 runtime 冒烟 + 大脑实测）：
+
+1. 改端口后旧端口拒绝、新端口接受，**已有链路 RPC 仍通**；
+2. 绑定已占用端口返回 `EADDRINUSE`，原监听保留、仍能接受新连接；
+3. 重启后面板覆盖的设置自动恢复（`listenSource=settings`）；`reset:true` 回到 `config.json` 端口；
+4. 大脑生产实例实测：`listen={127.0.0.1:47201}, listenSource=config`；把端口改到已占用的 3080 → `{ok:false,error:"listen EADDRINUSE..."}`，47201 仍 LISTEN、静态 peer 仍 online；
+5. 端到端脚本 `scripts/e2e-listen.sh`（临时 pair-node）覆盖：改端口→用新端口配对成功→占用端口失败回滚→reset→清理。
+
+![监听设置面板（fixture 数据）](assets/remotenode-panel-listen.png)
+
+端到端脚本 `scripts/e2e-listen.sh`（临时 pair-node，node-env 实测 **39 PASS / 0 FAIL**，连跑 2 次；Lead 独立复跑 39/39）：
+
+1. 默认监听读取正确（47401/config/override=false）；
+2. 改为 `0.0.0.0:48401`：返回 ok、state 更新、48401 LISTEN、47401 关闭、新端口可连/旧端口 refused；
+3. 用**新端口**配对：pendingPairs → approve → 双方 online（source=paired）；
+4. 改到被占用端口：返回 `EADDRINUSE`，原监听与链路均不受影响；
+5. `reset:true` 回 `config.json` 端口，`listenOverride=false`、旧自定义端口释放、链路保持 online；并验证 `peer.listen` 通知把对端 paired 记录端口自动更新；
+6. 生产实例零残留（3080 只剩 `desktop-node(config)`、pendingPairs 空、peers.json 无测试节点、config.json md5 未变）。
+
+## 9. 已知问题 / 下一步（建议 M2 优先级）
 
 1. **审批转发**（最高价值）：执行侧把 `approval/request` 经 link 转发给发起侧面板，先到先得 + fail-closed；解锁「节点以 ask 策略无人值守」。
 2. **本机普通会话 `present` 自动同步**：监听本机 link 相关会话的 `deliverables/presented`，补齐双向交付物（现在远程会话自动、本机走 publish）。

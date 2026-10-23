@@ -170,6 +170,17 @@ export function registerRoutes(ctx, runtime) {
         return
       }
 
+      if (path === `${API_PATH}/listen` && method === 'POST') {
+        const body = await readJsonBody(req)
+        sendJson(res, 200, await runtime.api.setListen({
+          enabled: body.enabled === undefined ? undefined : body.enabled === true,
+          host: text(body.host),
+          port: body.port,
+          reset: body.reset === true,
+        }))
+        return
+      }
+
       if (path === `${API_PATH}/peers/pair` && method === 'POST') {
         const body = await readJsonBody(req)
         sendJson(res, 200, await runtime.api.pair({

@@ -209,6 +209,31 @@ window.__ModuleLoader__.load({
       confirmRemove: '确认删除',
       removing: '删除中…',
       nodeRemoved: '已删除节点',
+      listenTitle: '监听',
+      listenDisabled: '已关闭',
+      listenHint: '对等监听用于接受其它节点的连接；从这里修改会立即生效（无需重启 DSH）。',
+      listenEnabledLabel: '启用对等监听',
+      listenSourcePrefix: '来源',
+      listenSourceSettings: '面板设置',
+      listenSourceConfig: '配置文件',
+      listenSourceDefault: '默认',
+      listenEdit: '修改',
+      listenEditTitle: '修改监听设置',
+      listenEditHint: '127.0.0.1 / localhost 只允许本机连接；要允许其它节点从外部接入，请绑定 0.0.0.0 或具体网卡 IP，并在防火墙放行该端口。',
+      listenHostLabel: '绑定地址（IP / 主机名）',
+      listenHostPlaceholder: '例如：127.0.0.1 或 0.0.0.0',
+      listenHostHint: '127.0.0.1 / localhost 仅本机；0.0.0.0 或具体网卡 IP 才可被外部连接。',
+      listenPortLabel: '端口',
+      listenPortPlaceholder: '例如：47201',
+      listenExternalWarning: '当前绑定地址可被外部网络连接：请确认防火墙只放行可信来源，并注意密钥与配对令牌安全。',
+      needListenHost: '请填写绑定地址',
+      needListenPort: '请填写有效端口（1-65535）',
+      listenSave: '保存',
+      listenSaving: '保存中…',
+      listenSaved: '监听设置已保存',
+      listenReset: '恢复配置文件设置',
+      listenResetDone: '已恢复为配置文件中的监听设置',
+      listenResetFailed: '恢复监听设置失败',
     }
     const EN = {
       nav: 'Remote node',
@@ -373,6 +398,31 @@ window.__ModuleLoader__.load({
       confirmRemove: 'Confirm remove',
       removing: 'Removing…',
       nodeRemoved: 'Node removed',
+      listenTitle: 'Listener',
+      listenDisabled: 'Disabled',
+      listenHint: 'The peer listener accepts connections from other nodes; changes here apply immediately without restarting DSH.',
+      listenEnabledLabel: 'Enable peer listener',
+      listenSourcePrefix: 'Source',
+      listenSourceSettings: 'Panel settings',
+      listenSourceConfig: 'Config file',
+      listenSourceDefault: 'Default',
+      listenEdit: 'Edit',
+      listenEditTitle: 'Edit listen settings',
+      listenEditHint: '127.0.0.1 / localhost accepts local connections only. To let remote peers connect, bind 0.0.0.0 or a specific interface IP and open the port in your firewall.',
+      listenHostLabel: 'Bind address (IP / hostname)',
+      listenHostPlaceholder: 'e.g. 127.0.0.1 or 0.0.0.0',
+      listenHostHint: '127.0.0.1 / localhost = local only; 0.0.0.0 or an interface IP is externally reachable.',
+      listenPortLabel: 'Port',
+      listenPortPlaceholder: 'e.g. 47201',
+      listenExternalWarning: 'This bind address is reachable from the network: make sure your firewall only exposes it to trusted sources and keep secrets and pairing tokens safe.',
+      needListenHost: 'Enter a bind address',
+      needListenPort: 'Enter a valid port (1-65535)',
+      listenSave: 'Save',
+      listenSaving: 'Saving…',
+      listenSaved: 'Listen settings saved',
+      listenReset: 'Restore config setting',
+      listenResetDone: 'Restored the listen settings from the config file',
+      listenResetFailed: 'Failed to restore listen settings',
     }
 
     /** 当前翻译函数；locale 服务就绪前用 zh 回退。 */
@@ -678,6 +728,11 @@ window.__ModuleLoader__.load({
           host: textOr(listen.host, '127.0.0.1'),
           port: numOrNull(listen.port),
         },
+        // v1.2：旧 Host 没有这两个字段，按 config 展示，不报错。
+        listenSource: value.listenSource === 'settings' || value.listenSource === 'default'
+          ? value.listenSource
+          : 'config',
+        listenOverride: value.listenOverride === true,
       }
     }
     function normalizePeer(value, index) {
@@ -1054,6 +1109,11 @@ window.__ModuleLoader__.load({
 .rn-modal-hint { font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
 .rn-modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .rn-token-input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .5px; }
+.rn-listen-value { flex: 0 1 auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-layer-2); border: 1px solid var(--dsw-alias-border-l1); border-radius: 7px; padding: 3px 8px; white-space: nowrap; }
+.rn-listen-off { color: var(--dsw-alias-label-tertiary); }
+.rn-check-row { flex-direction: row; align-items: center; gap: 8px; font-size: 12.5px; line-height: 1.5; color: var(--dsw-alias-label-primary); cursor: pointer; }
+.rn-check-row input[type="checkbox"] { margin: 0; flex: none; }
+.rn-field-hint { font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); overflow-wrap: anywhere; }
 `
 
     /** 唯一的样式注入点：一个 React <style> 元素（不碰 document.head/body）。 */
@@ -1096,6 +1156,132 @@ window.__ModuleLoader__.load({
     /** 节点来源标签文案。 */
     function peerSourceText(peer) {
       return peer && peer.source === 'paired' ? t('sourcePaired') : t('sourceConfig')
+    }
+
+    /** 是否 loopback（决定弹窗内是否提示对外暴露风险）。 */
+    function isLoopbackHost(host) {
+      const text = asText(host).trim().toLowerCase()
+      if (text === '') return true
+      if (text === 'localhost' || text === '::1' || text === '[::1]') return true
+      if (text === '127.0.0.1') return true
+      if (text.indexOf('127.') === 0) return true
+      return false
+    }
+    /** 监听来源文案（v1.2 §11.4）。 */
+    function listenSourceText(source) {
+      if (source === 'settings') return t('listenSourceSettings')
+      if (source === 'default') return t('listenSourceDefault')
+      return t('listenSourceConfig')
+    }
+    /** 监听值展示文本，如 127.0.0.1:47201 / 已关闭。 */
+    function listenText(listen) {
+      const item = isObject(listen) ? listen : {}
+      if (item.enabled !== true) return t('listenDisabled')
+      const host = asText(item.host)
+      const port = numOrNull(item.port)
+      return (host === '' ? '?' : host) + ':' + (port === null ? '?' : String(port))
+    }
+
+    /**
+     * 「监听」卡片（v1.2 §11.4）：显示有效 enabled/host:port 与来源，
+     * 提供「修改」；存在面板覆盖（listenOverride）时提供「恢复配置文件设置」。
+     * self 为 null（初始加载/旧 Host）时隐藏。
+     */
+    function renderListenCard(self, opts) {
+      if (!self) return null
+      const listen = isObject(self.listen) ? self.listen : { enabled: false, host: '', port: null }
+      const source = listenSourceText(self.listenSource)
+      const enabled = listen.enabled === true
+      const children = [
+        h('span', { key: 'label', className: 'rn-pairing-label' }, t('listenTitle')),
+        h('span', { key: 'value', className: 'rn-listen-value' + (enabled ? '' : ' rn-listen-off') }, listenText(listen)),
+        h('span', {
+          key: 'source',
+          className: 'rn-source-tag' + (self.listenSource === 'settings' ? ' rn-source-tag-paired' : ''),
+          title: t('listenSourcePrefix') + ' ' + source,
+        }, t('listenSourcePrefix') + ' ' + source),
+        h('div', { key: 'actions', className: 'rn-token-actions' },
+          h('button', {
+            type: 'button',
+            className: 'rn-btn rn-btn-sm',
+            onClick: opts.onEdit,
+          }, t('listenEdit')),
+          self.listenOverride === true
+            ? h('button', {
+              key: 'reset',
+              type: 'button',
+              className: 'rn-btn rn-btn-sm',
+              disabled: opts.busy === 'listen-reset',
+              onClick: opts.onReset,
+            }, opts.busy === 'listen-reset' ? t('listenSaving') : t('listenReset'))
+            : null),
+        h('span', { key: 'hint', className: 'rn-pairing-hint' }, t('listenHint')),
+      ]
+      return h('section', { className: 'rn-section', key: 'listen' },
+        h('div', { className: 'rn-pairing' }, children))
+    }
+
+    /** 「修改监听设置」弹窗（v1.2 §11.4）：启用开关 + 绑定地址 + 端口 + 校验/安全提示/后端错误。 */
+    function renderListenModal(opts) {
+      const saving = opts.saving === true
+      const external = isLoopbackHost(opts.host) === false
+      const children = [
+        h('div', { key: 'title', className: 'rn-modal-title' }, t('listenEditTitle')),
+        h('div', { key: 'hint', className: 'rn-modal-hint' }, t('listenEditHint')),
+        h('label', { key: 'enabled', className: 'rn-field rn-check-row' },
+          h('input', {
+            type: 'checkbox',
+            checked: opts.enabled === true,
+            onChange: opts.onEnabledChange,
+          }),
+          h('span', null, t('listenEnabledLabel'))),
+        h('label', { key: 'host', className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('listenHostLabel')),
+          h('input', {
+            className: 'rn-input',
+            type: 'text',
+            value: opts.host,
+            placeholder: t('listenHostPlaceholder'),
+            onChange: opts.onHostChange,
+          }),
+          h('span', { className: 'rn-field-hint' }, t('listenHostHint'))),
+        h('label', { key: 'port', className: 'rn-field' },
+          h('span', { className: 'rn-field-label' }, t('listenPortLabel')),
+          h('input', {
+            className: 'rn-input',
+            type: 'text',
+            inputMode: 'numeric',
+            value: opts.port,
+            placeholder: t('listenPortPlaceholder'),
+            onChange: opts.onPortChange,
+          })),
+      ]
+      if (external) {
+        children.push(h('div', { key: 'external', className: 'rn-alert rn-alert-warn', role: 'status' },
+          h('span', null, t('listenExternalWarning'))))
+      }
+      if (opts.error !== '') {
+        children.push(h('div', { key: 'error', className: 'rn-alert', role: 'alert' },
+          h('span', null, opts.error)))
+      }
+      children.push(h('div', { key: 'actions', className: 'rn-modal-actions' },
+        h('button', { key: 'cancel', type: 'button', className: 'rn-btn', disabled: saving, onClick: opts.onClose }, t('cancel')),
+        h('button', {
+          key: 'save',
+          type: 'button',
+          className: 'rn-btn rn-btn-primary',
+          disabled: saving,
+          onClick: opts.onSave,
+        }, saving ? t('listenSaving') : t('listenSave'))))
+      return h('div', {
+        className: 'rn-modal-backdrop',
+        key: 'listen-modal',
+        onMouseDown: function (event) {
+          if (!event) return
+          if (event.target === event.currentTarget && !saving) opts.onClose()
+        },
+      },
+      h('div', { className: 'rn-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('listenEditTitle') }, children))
     }
 
     /**
@@ -1854,6 +2040,12 @@ window.__ModuleLoader__.load({
       const [addToken, setAddToken] = useState('')
       const [tokenVisible, setTokenVisible] = useState(false)
       const [confirmRemove, setConfirmRemove] = useState('')
+      const [listenOpen, setListenOpen] = useState(false)
+      const [listenEnabled, setListenEnabled] = useState(true)
+      const [listenHost, setListenHost] = useState('')
+      const [listenPort, setListenPort] = useState('')
+      const [listenSaving, setListenSaving] = useState(false)
+      const [listenError, setListenError] = useState('')
 
       const data = polling.data
       const reload = polling.reload
@@ -2073,6 +2265,59 @@ window.__ModuleLoader__.load({
         })
       }
 
+      // —— v1.2 监听设置（§11.4）——
+
+      function onOpenListen() {
+        const listen = self && isObject(self.listen) ? self.listen : null
+        setListenEnabled(listen === null ? true : listen.enabled === true)
+        setListenHost(listen !== null && listen.host !== '' ? listen.host : '127.0.0.1')
+        setListenPort(listen !== null && listen.port !== null ? String(listen.port) : '')
+        setListenError('')
+        setListenOpen(true)
+        setFlash(null)
+      }
+
+      function onCloseListen() {
+        if (listenSaving) return
+        setListenOpen(false)
+      }
+
+      function onListenSave() {
+        if (listenSaving) return
+        const host = listenHost.trim()
+        const portText = listenPort.trim()
+        const port = Number(portText)
+        if (host === '') {
+          setListenError(t('needListenHost'))
+          return
+        }
+        if (!isFinite(port) || port <= 0 || port > 65535 || Math.floor(port) !== port) {
+          setListenError(t('needListenPort'))
+          return
+        }
+        setListenSaving(true)
+        setListenError('')
+        apiPost('/listen', { enabled: listenEnabled === true, host: host, port: port }).then(function (body) {
+          setListenSaving(false)
+          setListenOpen(false)
+          const listen = isObject(body) && isObject(body.listen) ? body.listen : null
+          setFlash({
+            kind: 'ok',
+            text: t('listenSaved') + (listen === null ? '' : '：' + listenText(listen)),
+          })
+          reload()
+        }).catch(function (failure) {
+          // 端口占用 / 权限不足等后端错误按原文展示在弹窗内。
+          setListenSaving(false)
+          setListenError(errText(failure))
+        })
+      }
+
+      function onListenReset() {
+        if (busy === 'listen-reset') return
+        run('listen-reset', function () { return apiPost('/listen', { reset: true }) }, t('listenResetDone'))
+      }
+
       const peerValue = pickPeer()
       const forms = []
       if (openForm === 'start') {
@@ -2180,6 +2425,11 @@ window.__ModuleLoader__.load({
         if (data === null && polling.error === '') {
           scrollChildren.push(h('div', { className: 'rn-empty', key: 'loading' }, t('loadingState')))
         }
+        scrollChildren.push(renderListenCard(self, {
+          busy: busy,
+          onEdit: onOpenListen,
+          onReset: onListenReset,
+        }))
         scrollChildren.push(renderPairingBar(pairing, {
           visible: tokenVisible,
           busy: busy,
@@ -2226,13 +2476,38 @@ window.__ModuleLoader__.load({
           })
           : null
 
+        const listenModal = listenOpen
+          ? renderListenModal({
+            saving: listenSaving,
+            enabled: listenEnabled,
+            host: listenHost,
+            port: listenPort,
+            error: listenError,
+            onEnabledChange: function (event) {
+              setListenEnabled(Boolean(event && event.target && event.target.checked))
+              setListenError('')
+            },
+            onHostChange: function (event) {
+              setListenHost(event && event.target ? asText(event.target.value) : '')
+              setListenError('')
+            },
+            onPortChange: function (event) {
+              setListenPort(event && event.target ? asText(event.target.value) : '')
+              setListenError('')
+            },
+            onSave: onListenSave,
+            onClose: onCloseListen,
+          })
+          : null
+
         return h('div', { className: 'rn-root' },
           StyleTag(),
           header,
           errorBars,
           forms,
           h('div', { className: 'rn-scroll' }, scrollChildren),
-          addModal)
+          addModal,
+          listenModal)
       } catch (failure) {
         return h('div', { className: 'rn-root' },
           StyleTag(),

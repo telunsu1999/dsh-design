@@ -98,6 +98,49 @@ function writeFramed(socket, payload) {
   socket.write(Buffer.concat([header, payload]))
 }
 
+/** 尝试 TCP 连接；成功 resolve socket，失败 reject（error.code 保留）。 */
+function tcpConnect(port, options = {}) {
+  const host = options.host ?? '127.0.0.1'
+  const timeoutMs = options.timeoutMs ?? 1500
+  return new Promise((resolve, reject) => {
+    const socket = netConnect({ host, port })
+    const timer = setTimeout(() => {
+      socket.destroy()
+      const error = new Error(`connect timeout to ${host}:${port}`)
+      error.code = 'ETIMEDOUT'
+      reject(error)
+    }, timeoutMs)
+    timer.unref?.()
+    const onError = error => {
+      clearTimeout(timer)
+      reject(error)
+    }
+    socket.once('error', onError)
+    socket.once('connect', () => {
+      clearTimeout(timer)
+      socket.off('error', onError)
+      resolve(socket)
+    })
+  })
+}
+
+/** 断言端口当前不可连接（监听已关闭/已搬迁）。 */
+async function assertPortClosed(port) {
+  await assert.rejects(tcpConnect(port), error => {
+    assert.ok(
+      ['ECONNREFUSED', 'EHOSTUNREACH', 'ETIMEDOUT', 'ECONNRESET'].includes(error?.code),
+      `unexpected connect error code: ${error?.code} (${error?.message})`,
+    )
+    return true
+  })
+}
+
+/** 断言端口有监听（可建立 TCP 连接），随后关闭探测 socket。 */
+async function assertPortOpen(port) {
+  const socket = await tcpConnect(port)
+  socket.destroy()
+}
+
 // 默认 manager 配置（测试用短心跳，避免慢测）。
 const MANAGER_TUNING = Object.freeze({
   requestTimeoutMs: 2000,
@@ -893,5 +936,236 @@ test('addPeer 自动拨号建链（source=paired）、removePeer 关链且不再
     assert.equal(a.state()[0].source, 'paired')
   } finally {
     await Promise.allSettled([a.stop(), b.stop()])
+  }
+})
+
+// =====================================================================
+// 9. setListen：运行时改监听端口（旧端口关闭 / 新 peer 可连 / 已有链路 RPC 仍通）
+// =====================================================================
+
+test('setListen：改到随机空闲端口即时生效、旧端口不再监听、已有链路 RPC 仍通、新 peer 可连新端口', async () => {
+  const secret = randomBytes(32).toString('hex')
+  const [oldPort, portB, portC, newPort] = [await freePort(), await freePort(), await freePort(), await freePort()]
+  const echoHandler = (link, method, params) => (method === 'echo' ? { by: link.nodeId, params } : undefined)
+  const tuning = { requestTimeoutMs: 2000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 1500, rttIntervalMs: 100 }
+  const loggerA = recordingLogger()
+
+  // A(brain) 监听 oldPort；B(desk) 主动拨 A → 先建立一条已有链路。
+  const a = createPeerManager({
+    config: {
+      nodeId: 'brain-test',
+      nodeName: 'brain-test',
+      listen: { enabled: true, host: '127.0.0.1', port: oldPort },
+      peers: [{ nodeId: 'desk-test', nodeName: 'desk-test', host: '127.0.0.1', port: portB, secret, dial: 'off' }],
+      ...tuning,
+    },
+    instanceEpoch: 'brain-test-epoch',
+    logger: loggerA,
+    handlers: { onRequest: echoHandler },
+  })
+  const b = createPeerManager({
+    config: {
+      nodeId: 'desk-test',
+      nodeName: 'desk-test',
+      listen: { enabled: true, host: '127.0.0.1', port: portB },
+      peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: oldPort, secret, dial: 'auto' }],
+      ...tuning,
+    },
+    instanceEpoch: 'desk-test-epoch',
+    logger: silentLogger(),
+    handlers: { onRequest: echoHandler },
+  })
+  // C(laptop) 之后拨 A 的**新**端口，验证新监听真的可用。
+  const c = createPeerManager({
+    config: {
+      nodeId: 'laptop-test',
+      nodeName: 'laptop-test',
+      listen: { enabled: true, host: '127.0.0.1', port: portC },
+      peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: newPort, secret, dial: 'auto' }],
+      ...tuning,
+    },
+    instanceEpoch: 'laptop-test-epoch',
+    logger: silentLogger(),
+    handlers: { onRequest: echoHandler },
+  })
+  try {
+    await Promise.all([a.start(), b.start()])
+    await waitFor(() => a.activeLinkCount() === 1 && b.activeLinkCount() === 1, { label: 'initial pair online' })
+    assert.deepEqual(a.listenInfo(), { enabled: true, host: '127.0.0.1', port: oldPort })
+
+    // (1) 改监听到随机空闲端口。
+    const changed = await a.setListen({ enabled: true, host: '127.0.0.1', port: newPort })
+    assert.deepEqual(changed, { ok: true, listen: { enabled: true, host: '127.0.0.1', port: newPort } })
+    assert.deepEqual(a.listenInfo(), { enabled: true, host: '127.0.0.1', port: newPort })
+    assert.equal(a.listenPort, newPort)
+
+    // (2) 旧端口不再监听；新端口在监听。
+    await assertPortClosed(oldPort)
+    await assertPortOpen(newPort)
+
+    // (3) 已有链路（A 侧是 listener 的 inbound link）在重绑后 RPC 仍通。
+    assert.deepEqual(
+      await a.linkFor('desk-test').request('echo', { n: 1 }),
+      { by: 'desk-test', params: { n: 1 } },
+    )
+
+    // (4) 新 peer 能连上新端口：先让 A 认识 C（paired 来源），再启动 C 自动拨号。
+    assert.ok(a.addPeer({ nodeId: 'laptop-test', nodeName: 'laptop-test', host: '127.0.0.1', port: portC, secret, dial: 'off', source: 'paired' }))
+    await c.start()
+    await waitFor(() => a.activeLinkCount() === 2 && c.activeLinkCount() === 1, {
+      label: 'new peer connects to the rebound port',
+    })
+    assert.deepEqual(
+      await c.linkFor('brain-test').request('echo', { p: 'c' }),
+      { by: 'brain-test', params: { p: 'c' } },
+    )
+
+    // (5) 配置未变的幂等调用直接成功，监听与链路均不变。
+    const listenBefore = a.listenPort
+    const linkBefore = a.linkFor('desk-test')
+    const again = await a.setListen({ enabled: true, host: '127.0.0.1', port: newPort })
+    assert.equal(again.ok, true)
+    assert.equal(a.listenPort, listenBefore)
+    assert.equal(a.linkFor('desk-test'), linkBefore)
+    assert.deepEqual(await b.linkFor('brain-test').request('echo', { n: 2 }), { by: 'brain-test', params: { n: 2 } })
+  } finally {
+    await Promise.allSettled([c.stop(), a.stop(), b.stop()])
+  }
+})
+
+// =====================================================================
+// 10. setListen：绑定失败回滚 / disabled 释放端口 / 重新 enabled 恢复
+// =====================================================================
+
+test('setListen：绑定占用端口返回 ok:false 且旧监听仍工作；enabled=false 释放端口；重新 enabled 恢复', async () => {
+  const secret = randomBytes(32).toString('hex')
+  const portA = await freePort()
+  const echoHandler = (link, method, params) => (method === 'echo' ? { by: link.nodeId, params } : undefined)
+  const tuning = { requestTimeoutMs: 2000, heartbeatIntervalMs: 100, heartbeatTimeoutMs: 1500, rttIntervalMs: 100 }
+
+  // 占位 server：模拟「端口已被其他进程占用」。
+  const occupied = createNetServer()
+  await new Promise((resolve, reject) => {
+    occupied.once('error', reject)
+    occupied.listen(0, '127.0.0.1', resolve)
+  })
+  const occupiedAddress = occupied.address()
+  const occupiedPort = occupiedAddress !== null && typeof occupiedAddress === 'object' ? occupiedAddress.port : 0
+
+  const a = createPeerManager({
+    config: {
+      nodeId: 'brain-test',
+      nodeName: 'brain-test',
+      listen: { enabled: true, host: '127.0.0.1', port: portA },
+      peers: [{ nodeId: 'laptop-test', nodeName: 'laptop-test', host: '127.0.0.1', port: 9, secret, dial: 'off' }],
+      ...tuning,
+    },
+    instanceEpoch: 'brain-test-epoch',
+    logger: recordingLogger(),
+    handlers: { onRequest: echoHandler },
+  })
+  /** @type {any[]} */
+  const extraManagers = []
+  try {
+    await a.start()
+    // C 主动拨 A，建立一条已有链路（用于验证 disable/重绑后链路不受影响）。
+    const c = createPeerManager({
+      config: {
+        nodeId: 'laptop-test',
+        nodeName: 'laptop-test',
+        listen: { enabled: true, host: '127.0.0.1', port: 0 },
+        peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: portA, secret, dial: 'auto' }],
+        ...tuning,
+      },
+      instanceEpoch: 'laptop-test-epoch',
+      logger: silentLogger(),
+      handlers: { onRequest: echoHandler },
+    })
+    extraManagers.push(c)
+    await c.start()
+    await waitFor(() => a.activeLinkCount() === 1 && c.activeLinkCount() === 1, { label: 'pair online' })
+    const originalInfo = a.listenInfo()
+    assert.deepEqual(originalInfo, { enabled: true, host: '127.0.0.1', port: portA })
+
+    // (1) 绑定被占用端口 → ok:false，旧监听恢复且仍能接受新连接。
+    const failed = await a.setListen({ enabled: true, host: '127.0.0.1', port: occupiedPort })
+    assert.equal(failed.ok, false)
+    assert.match(String(failed.error), /EADDRINUSE/)
+    assert.deepEqual(a.listenInfo(), originalInfo)
+    await assertPortOpen(portA)
+    // 已有链路不受影响。
+    assert.deepEqual(
+      await c.linkFor('brain-test').request('echo', { after: 'rollback' }),
+      { by: 'brain-test', params: { after: 'rollback' } },
+    )
+    // 旧监听确实还能完成新的对等握手：起一个新 node D 拨过来。
+    assert.ok(a.addPeer({ nodeId: 'tablet-test', nodeName: 'tablet-test', host: '127.0.0.1', port: 9, secret, dial: 'off', source: 'paired' }))
+    const d = createPeerManager({
+      config: {
+        nodeId: 'tablet-test',
+        nodeName: 'tablet-test',
+        listen: { enabled: true, host: '127.0.0.1', port: 0 },
+        peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: portA, secret, dial: 'auto' }],
+        ...tuning,
+      },
+      instanceEpoch: 'tablet-test-epoch',
+      logger: silentLogger(),
+      handlers: { onRequest: echoHandler },
+    })
+    extraManagers.push(d)
+    await d.start()
+    await waitFor(() => d.activeLinkCount() === 1 && a.activeLinkCount() === 2, {
+      label: 'new peer connects to restored listener',
+    })
+
+    // (2) enabled=false：只关闭监听，端口释放，已有链路仍可用。
+    const disabled = await a.setListen({ enabled: false })
+    assert.deepEqual(disabled, { ok: true, listen: { enabled: false, host: '127.0.0.1', port: portA } })
+    assert.deepEqual(a.listenInfo(), { enabled: false, host: '127.0.0.1', port: portA })
+    assert.equal(a.listenPort, null)
+    await assertPortClosed(portA)
+    assert.deepEqual(
+      await c.linkFor('brain-test').request('echo', { after: 'disable' }),
+      { by: 'brain-test', params: { after: 'disable' } },
+    )
+    // 幂等 disable。
+    assert.deepEqual(await a.setListen({ enabled: false }), { ok: true, listen: { enabled: false, host: '127.0.0.1', port: portA } })
+
+    // (3) 重新 enabled（同 host/port）→ 恢复监听，新 peer 能连。
+    const reenabled = await a.setListen({ enabled: true, host: '127.0.0.1', port: portA })
+    assert.deepEqual(reenabled, { ok: true, listen: { enabled: true, host: '127.0.0.1', port: portA } })
+    assert.equal(a.listenPort, portA)
+    await assertPortOpen(portA)
+    assert.ok(a.addPeer({ nodeId: 'phone-test', nodeName: 'phone-test', host: '127.0.0.1', port: 9, secret, dial: 'off', source: 'paired' }))
+    const e = createPeerManager({
+      config: {
+        nodeId: 'phone-test',
+        nodeName: 'phone-test',
+        listen: { enabled: true, host: '127.0.0.1', port: 0 },
+        peers: [{ nodeId: 'brain-test', nodeName: 'brain-test', host: '127.0.0.1', port: portA, secret, dial: 'auto' }],
+        ...tuning,
+      },
+      instanceEpoch: 'phone-test-epoch',
+      logger: silentLogger(),
+      handlers: { onRequest: echoHandler },
+    })
+    extraManagers.push(e)
+    await e.start()
+    await waitFor(() => e.activeLinkCount() === 1 && a.activeLinkCount() === 3, {
+      label: 'new peer connects after re-enable',
+    })
+    // 已有两条旧链路仍在线且可 RPC。
+    assert.equal(c.activeLinkCount(), 1)
+    assert.equal(d.activeLinkCount(), 1)
+    assert.deepEqual(await e.linkFor('brain-test').request('echo', { final: true }), { by: 'brain-test', params: { final: true } })
+  } finally {
+    await Promise.allSettled([...extraManagers.map(manager => manager.stop()), a.stop()])
+    await new Promise(resolve => {
+      try {
+        occupied.close(resolve)
+      } catch {
+        resolve(undefined)
+      }
+    })
   }
 })

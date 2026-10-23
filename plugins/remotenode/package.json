@@ -1,6 +1,6 @@
 {
   "name": "@dsh-design/remotenode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Remote Node plugin for DeepSeek Harness: peer links between DSH instances, remote sessions with origin markers, and bidirectional deliverable sync.",
   "type": "module",

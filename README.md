@@ -25,6 +25,7 @@
 ```
 
 - 节点管理：面板内「配对令牌 + 添加节点 + 对端审批 + 删除」，无需手写配置（v0.2.0）
+- 监听端口可改：面板「监听」卡片直接改绑定地址/端口（应对防火墙只放行特定端口，v0.3.0）
 - 设计：[docs/06](docs/06-remotenode-design.zh.md)（总体）· [docs/07](docs/07-remotenode-m0-protocol.zh.md)（协议 v1）
 - 实现：[plugins/remotenode/](plugins/remotenode/README.md)（含 SPEC.md 接口契约、scripts、tests）
 - 验收：[docs/08-remotenode-plugin.zh.md](docs/08-remotenode-plugin.zh.md)
